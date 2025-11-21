@@ -1,0 +1,2194 @@
+"""
+worker/ats_processing.py
+ATS Processing Module with Skills Matrix and Enhanced Rate Limiting
+COMPLETE CLEAN VERSION - Ready to use
+"""
+
+import os
+import sys
+import time
+import random
+import json
+import uuid
+from typing import Dict, List, Any, Optional, Tuple
+from datetime import datetime
+from pathlib import Path
+import re
+from io import BytesIO
+from utils import bigquery_ats_utils as bq_ats
+
+# Third-party imports
+import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+
+# Google Cloud imports
+from google.cloud import bigquery
+from google.oauth2 import service_account
+import vertexai
+from vertexai.generative_models import GenerativeModel
+
+# Internal imports
+from utils.file_utils import get_text_from_file
+import config
+
+# ============================================================================
+# RATE LIMITING
+# ============================================================================
+
+class RateLimiter:
+    """Intelligent rate limiter for Gemini API calls with exponential backoff"""
+    
+    def __init__(self, requests_per_minute: int = 8, max_retries: int = 5):
+        self.requests_per_minute = requests_per_minute
+        self.max_retries = max_retries
+        self.request_times = []
+        self.backoff_base = 2.0
+        self.total_requests = 0
+        self.failed_requests = 0
+        
+    def wait_if_needed(self):
+        """Wait if we're approaching rate limits"""
+        now = time.time()
+        self.request_times = [t for t in self.request_times if now - t < 60]
+        
+        if len(self.request_times) >= self.requests_per_minute:
+            sleep_time = 60 - (now - self.request_times[0]) + 1
+            if sleep_time > 0:
+                print(f"   ⏳ Rate limit approaching. Waiting {sleep_time:.1f}s...")
+                time.sleep(sleep_time)
+                self.request_times = []
+        
+        self.request_times.append(now)
+        self.total_requests += 1
+    
+    def execute_with_retry(self, func, *args, **kwargs):
+        """Execute function with exponential backoff retry"""
+        for attempt in range(self.max_retries):
+            try:
+                self.wait_if_needed()
+                result = func(*args, **kwargs)
+                return result
+            except Exception as e:
+                error_msg = str(e)
+                if "429" in error_msg or "quota" in error_msg.lower() or "Resource exhausted" in error_msg:
+                    if attempt < self.max_retries - 1:
+                        wait_time = (self.backoff_base ** attempt) + random.uniform(0, 1)
+                        print(f"   ⚠️ Quota hit (429). Retry {attempt + 1}/{self.max_retries} in {wait_time:.1f}s...")
+                        time.sleep(wait_time)
+                    else:
+                        print(f"   ❌ Failed after {self.max_retries} retries")
+                        self.failed_requests += 1
+                        return None
+                else:
+                    print(f"   ⚠️ Error: {error_msg}")
+                    raise e
+        return None
+    
+    def get_stats(self) -> Dict:
+        """Get rate limiter statistics"""
+        return {
+            'total_requests': self.total_requests,
+            'failed_requests': self.failed_requests,
+            'success_rate': ((self.total_requests - self.failed_requests) / self.total_requests * 100) 
+                           if self.total_requests > 0 else 0
+        }
+
+
+# Initialize global rate limiter
+rate_limiter = RateLimiter(requests_per_minute=8, max_retries=5)
+
+
+# ============================================================================
+# SKILLS DATABASE
+# ============================================================================
+
+SKILLS_DATABASE = [
+    "python", "java", "javascript", "r", "scala", "go", "c++", "c#", "sql", 
+    "typescript", "kotlin", "swift", "php", "ruby", "perl", "shell",
+    "machine learning", "deep learning", "neural networks", "nlp", "natural language processing",
+    "computer vision", "tensorflow", "pytorch", "keras", "scikit-learn", "sklearn",
+    "xgboost", "lightgbm", "catboost", "random forest", "decision tree",
+    "logistic regression", "linear regression", "svm", "support vector machine", "naive bayes",
+    "k-means", "clustering", "pca", "dimensionality reduction",
+    "time series", "forecasting", "lstm", "rnn", "cnn", "gru", "transformer",
+    "bert", "gpt", "llm", "generative ai", "reinforcement learning",
+    "pandas", "numpy", "data science", "analytics", "statistics", "statistical analysis",
+    "data analysis", "data engineering", "etl", "data warehouse", "data pipeline",
+    "data cleaning", "data quality", "feature engineering",
+    "spark", "hadoop", "kafka", "airflow", "databricks", "hive", "pig",
+    "flink", "storm", "cassandra", "hbase", "presto", "athena",
+    "aws", "azure", "gcp", "google cloud", "cloud", "kubernetes", "docker",
+    "eks", "aks", "gke", "lambda", "ec2", "s3", "emr",
+    "azure ml", "sagemaker", "vertex ai", "cloud functions",
+    "postgresql", "mysql", "mongodb", "cassandra", "redis", "elasticsearch",
+    "dynamodb", "cosmosdb", "oracle", "sql server", "mariadb", "neo4j",
+    "bigquery", "redshift", "snowflake", "synapse",
+    "tableau", "powerbi", "power bi", "looker", "qlik", "matplotlib", 
+    "seaborn", "plotly", "ggplot", "d3.js", "d3", "dash", "streamlit",
+    "git", "github", "gitlab", "jenkins", "ci/cd", "jira", "confluence",
+    "terraform", "ansible", "linux", "unix",
+    "rest api", "api", "fastapi", "flask", "django", "microservices",
+    "graphql", "websocket", "http", "json", "xml",
+    "communication", "leadership", "analytical", "creative", "problem solving",
+    "team player", "teamwork", "agile", "scrum", "project management",
+    "stakeholder management", "presentation", "collaboration"
+]
+
+# Define skill categories at module level for better performance
+SKILL_CATEGORIES = {
+    'programming skills': ['python', 'java', 'javascript', 'c++', 'c#', 'ruby', 'go', 'rust', 
+                           'php', 'swift', 'kotlin', 'r', 'scala', 'perl', 'typescript'],
+    'database skills': ['sql', 'mysql', 'postgresql', 'mongodb', 'oracle', 'redis', 
+                       'cassandra', 'dynamodb', 'nosql'],
+    'cloud skills': ['aws', 'azure', 'gcp', 'google cloud', 'cloud computing'],
+    'analytical skills': ['data analysis', 'analytics', 'statistical analysis', 'data mining',
+                         'python', 'r', 'excel', 'tableau', 'power bi', 'pandas', 'numpy'],
+    'statistical skills': ['statistics', 'statistical analysis', 'regression', 'hypothesis testing',
+                          'probability', 'r', 'sas', 'spss', 'python', 'pandas', 'numpy'],
+    'data interpretation': ['data analysis', 'analytics', 'python', 'pandas', 'numpy', 'sql',
+                           'tableau', 'power bi', 'insights', 'reporting', 'visualization',
+                           'data mining', 'statistics'],
+    'machine learning skills': ['machine learning', 'ml', 'deep learning', 'neural networks',
+                               'tensorflow', 'pytorch', 'keras', 'scikit-learn', 'nlp'],
+    'visualization skills': ['tableau', 'power bi', 'matplotlib', 'seaborn', 'plotly', 
+                            'data visualization', 'dashboards'],
+    'big data skills': ['hadoop', 'spark', 'hive', 'kafka', 'big data', 'data engineering'],
+    'communication skills': ['written communication', 'verbal communication', 'presentation'],
+    'teamwork': ['collaboration', 'team player', 'cross-functional', 'team work'],
+    'leadership': ['team lead', 'leadership', 'mentoring', 'management'],
+}
+
+SKILL_SYNONYMS = {
+    'ml': 'machine learning',
+    'ai': 'artificial intelligence',
+    'dl': 'deep learning',
+    'nlp': 'natural language processing',
+    'cv': 'computer vision',
+    'aws': 'amazon web services',
+    'gcp': 'google cloud platform',
+    'sql': 'structured query language',
+    'js': 'javascript',
+    'ts': 'typescript',
+    'py': 'python',
+}
+
+
+def analyze_skills_match(cv_skills: List[str], required_skills: List[str]) -> Dict:
+    """
+    Analyze skills match between CV and JD with SMART MATCHING
+    
+    Improvements:
+    1. Handles generic skills (e.g., "programming skills" matched by Python, Java, etc.)
+    2. Handles synonyms (e.g., "ML" = "machine learning")
+    3. Better partial matching
+    """
+    
+    cv_skills_lower = [s.lower().strip() for s in cv_skills if s]
+    required_skills_lower = [s.lower().strip() for s in required_skills if s]
+    
+    def normalize_skill(skill: str) -> str:
+        """Normalize skill name using synonyms"""
+        skill_lower = skill.lower().strip()
+        return SKILL_SYNONYMS.get(skill_lower, skill_lower)
+    
+    def is_skill_matched(required_skill: str, cv_skills_list: List[str]) -> bool:
+        """
+        Check if a required skill is satisfied by any CV skill
+        
+        Returns True if:
+        1. Exact match exists
+        2. CV has a skill that belongs to the required category
+        3. Partial match exists (e.g., "data" in "data analysis")
+        """
+        required_normalized = normalize_skill(required_skill)
+        
+        # 1. Check exact match (normalized)
+        for cv_skill in cv_skills_list:
+            cv_normalized = normalize_skill(cv_skill)
+            if required_normalized == cv_normalized:
+                return True
+        
+        # 2. Check category match (for generic skills)
+        if required_normalized in SKILL_CATEGORIES:
+            category_skills = SKILL_CATEGORIES[required_normalized]
+            for cv_skill in cv_skills_list:
+                cv_normalized = normalize_skill(cv_skill)
+                if cv_normalized in category_skills:
+                    return True
+        
+        # 3. Check partial match (both directions)
+        for cv_skill in cv_skills_list:
+            cv_normalized = normalize_skill(cv_skill)
+            
+            # Check if required is part of CV skill (e.g., "python" in "python programming")
+            if required_normalized in cv_normalized and len(required_normalized) > 3:
+                return True
+            
+            # Check if CV skill is part of required (e.g., "sql" in "sql server")
+            if cv_normalized in required_normalized and len(cv_normalized) > 3:
+                return True
+        
+        return False
+    
+    # Analyze matches
+    matched = []
+    missing = []
+    
+    for required_skill in required_skills_lower:
+        if is_skill_matched(required_skill, cv_skills_lower):
+            matched.append(required_skill)
+        else:
+            missing.append(required_skill)
+    
+    match_percentage = (len(matched) / len(required_skills_lower) * 100) if required_skills_lower else 0
+    
+    return {
+        'skills_match_score': round(match_percentage, 2),
+        'matched_skills': matched,
+        'missing_skills': missing,
+        'matched_count': len(matched),
+        'required_count': len(required_skills_lower)
+    }
+
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+def call_gemini_with_retry(prompt: str, gemini_model, response_type: str = "text") -> Optional[str]:
+    """Generic Gemini API call with retry logic"""
+    
+    def call_gemini():
+        response = gemini_model.generate_content(prompt)
+        return response.text
+    
+    result = rate_limiter.execute_with_retry(call_gemini)
+    
+    if result and response_type == "json":
+        try:
+            cleaned = result.strip()
+            if cleaned.startswith("```json"):
+                cleaned = cleaned[7:]
+            if cleaned.startswith("```"):
+                cleaned = cleaned[3:]
+            if cleaned.endswith("```"):
+                cleaned = cleaned[:-3]
+            return cleaned.strip()
+        except:
+            return None
+    
+    return result
+
+
+def extract_skills_from_text(text: str) -> List[str]:
+    """Extract skills from text using keyword matching"""
+    text_lower = text.lower()
+    found_skills = []
+    
+    for skill in SKILLS_DATABASE:
+        if re.search(r'\b' + re.escape(skill) + r'\b', text_lower):
+            found_skills.append(skill)
+    
+    return list(set(found_skills))
+
+
+def extract_cv_structure_regex(cv_text: str) -> Dict:
+    """Fallback method to extract CV structure using regex"""
+    
+    email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+    emails = re.findall(email_pattern, cv_text)
+    email = emails[0] if emails else ""
+    
+    phone_pattern = r'[\+\d][\d\-\(\)\s]{8,}'
+    phones = re.findall(phone_pattern, cv_text)
+    phone = phones[0].strip() if phones else ""
+    
+    lines = [line.strip() for line in cv_text.split('\n') if line.strip()]
+    name = lines[0] if lines else "Unknown"
+    
+    return {
+        'name': name,
+        'email': email,
+        'phone': phone,
+        'current_company': '',
+        'total_experience': 0,
+        'current_role': ''
+    }
+
+
+# ============================================================================
+# GEMINI API FUNCTIONS
+# ============================================================================
+
+def extract_jd_skills(jd_text: str, gemini_model) -> List[str]:
+    """Extract required skills from job description"""
+    
+    prompt = f"""
+    Extract ALL required skills from this job description.
+    Include technical skills, soft skills, tools, technologies, and methodologies.
+    Return ONLY a JSON array of skills in lowercase, no other text.
+    
+    Job Description:
+    {jd_text}
+    
+    Format: ["python", "machine learning", "aws", "communication"]
+    """
+    
+    result = call_gemini_with_retry(prompt, gemini_model, response_type="json")
+    
+    if result:
+        try:
+            skills = json.loads(result)
+            return [s.lower().strip() for s in skills if s.strip()]
+        except Exception as e:
+            print(f"   ⚠️ Error parsing JD skills: {e}")
+    
+    return extract_skills_from_text(jd_text)
+
+
+def extract_cv_structure_with_gemini(cv_text: str, gemini_model) -> Dict:
+    """Extract structured information from CV"""
+    
+    prompt = f"""
+    Extract the following information from this CV and return ONLY valid JSON:
+    {{
+        "name": "Full Name",
+        "email": "email@example.com",
+        "phone": "phone number",
+        "current_company": "Current Company Name",
+        "total_experience": <years as float>,
+        "current_role": "Current Job Title"
+    }}
+    
+    CV Text (first 3000 chars):
+    {cv_text[:3000]}
+    
+    Return ONLY the JSON, no other text.
+    """
+    
+    result = call_gemini_with_retry(prompt, gemini_model, response_type="json")
+    
+    if result:
+        try:
+            data = json.loads(result)
+            return data
+        except Exception as e:
+            print(f"   ⚠️ Error parsing CV structure: {e}")
+    
+    return extract_cv_structure_regex(cv_text)
+
+
+def extract_employment_history_with_gemini(cv_text: str, gemini_model) -> Dict:
+    """Extract employment history for job hopping analysis"""
+    
+    prompt = f"""
+    Analyze the employment history in this CV and extract job changes.
+    Return ONLY valid JSON with this structure:
+    {{
+        "employment_history": [
+            {{
+                "company": "Company Name",
+                "role": "Job Title",
+                "start_date": "YYYY-MM or YYYY",
+                "end_date": "YYYY-MM or YYYY or Present",
+                "duration_months": <number of months as integer>
+            }}
+        ],
+        "total_jobs": <number of jobs>,
+        "average_tenure_months": <average months per job as float>
+    }}
+    
+    Instructions:
+    - Extract ALL job positions listed in the CV
+    - Calculate duration_months for each role (use best estimate if dates are unclear)
+    - Sort by most recent first
+    - Exclude internships, freelance, or part-time roles unless they're significant
+    
+    CV Text:
+    {cv_text[:4000]}
+    
+    Return ONLY the JSON, no other text.
+    """
+    
+    result = call_gemini_with_retry(prompt, gemini_model, response_type="json")
+    
+    if result:
+        try:
+            data = json.loads(result)
+            return data
+        except Exception as e:
+            print(f"   ⚠️ Error parsing employment history: {e}")
+    
+    # Fallback: basic structure
+    return {
+        "employment_history": [],
+        "total_jobs": 0,
+        "average_tenure_months": 0
+    }
+
+
+def analyze_job_hopping(employment_history: Dict, total_experience_years: float) -> Dict:
+    """Analyze job hopping patterns and calculate risk score"""
+    
+    jobs = employment_history.get('employment_history', [])
+    total_jobs = len(jobs)
+    
+    if total_jobs == 0 or total_experience_years == 0:
+        return {
+            'total_jobs': 0,
+            'average_tenure_months': 0,
+            'average_tenure_years': 0,
+            'job_changes': 0,
+            'stability_score': 50,  # Neutral score
+            'risk_level': 'Unknown',
+            'risk_color': 'gray',
+            'assessment': 'Insufficient employment history data',
+            'recommendation': 'Request detailed employment history during interview'
+        }
+    
+    # Calculate metrics
+    avg_tenure_months = employment_history.get('average_tenure_months', 0)
+    avg_tenure_years = avg_tenure_months / 12 if avg_tenure_months > 0 else 0
+    job_changes = total_jobs - 1
+    
+    # Calculate jobs per year
+    jobs_per_year = total_jobs / total_experience_years if total_experience_years > 0 else 0
+    
+    # Stability scoring (0-100, higher is better)
+    if avg_tenure_years >= 3:
+        stability_score = 90
+        risk_level = 'Low Risk'
+        risk_color = 'green'
+    elif avg_tenure_years >= 2:
+        stability_score = 75
+        risk_level = 'Low Risk'
+        risk_color = 'green'
+    elif avg_tenure_years >= 1.5:
+        stability_score = 60
+        risk_level = 'Medium Risk'
+        risk_color = 'yellow'
+    elif avg_tenure_years >= 1:
+        stability_score = 45
+        risk_level = 'Medium Risk'
+        risk_color = 'yellow'
+    else:
+        stability_score = 25
+        risk_level = 'High Risk'
+        risk_color = 'red'
+    
+    # Generate assessment
+    if risk_level == 'Low Risk':
+        assessment = f'Stable career progression with {avg_tenure_years:.1f} years average tenure.'
+    elif risk_level == 'Medium Risk':
+        assessment = f'Moderate job changes with {avg_tenure_years:.1f} years average tenure. May indicate career exploration or growth opportunities.'
+    else:
+        assessment = f'Frequent job changes with only {avg_tenure_years:.1f} years average tenure. High risk of short-term employment.'
+    
+    # Generate recommendation
+    if stability_score >= 75:
+        recommendation = 'Good retention potential. Candidate shows career stability.'
+    elif stability_score >= 50:
+        recommendation = 'Moderate retention risk. Discuss career goals and long-term plans during interview.'
+    else:
+        recommendation = 'High retention risk. Strongly recommend discussing reasons for frequent job changes.'
+    
+    return {
+        'total_jobs': total_jobs,
+        'average_tenure_months': round(avg_tenure_months, 1),
+        'average_tenure_years': round(avg_tenure_years, 2),
+        'job_changes': job_changes,
+        'jobs_per_year': round(jobs_per_year, 2),
+        'stability_score': stability_score,
+        'risk_level': risk_level,
+        'risk_color': risk_color,
+        'assessment': assessment,
+        'recommendation': recommendation
+    }
+
+
+def extract_jd_requirements_with_gemini(jd_text: str, gemini_model) -> Dict:
+    """Extract structured requirements from job description"""
+    
+    prompt = f"""
+    Analyze this job description and extract key requirements.
+    Return ONLY valid JSON with this structure:
+    {{
+        "required_skills": ["skill1", "skill2", ...],
+        "experience_required": <years as number>,
+        "domain": "Primary industry domain",
+        "role_level": "junior/mid/senior/lead"
+    }}
+    
+    Job Description:
+    {jd_text}
+    
+    Return ONLY the JSON, no other text.
+    """
+    
+    result = call_gemini_with_retry(prompt, gemini_model, response_type="json")
+    
+    if result:
+        try:
+            data = json.loads(result)
+            return data
+        except Exception as e:
+            print(f"   ⚠️ JD extraction error: {e}")
+    
+    return {
+        'required_skills': extract_skills_from_text(jd_text),
+        'experience_required': 3,
+        'domain': 'General',
+        'role_level': 'mid'
+    }
+
+
+def extract_position_from_jd(jd_text: str) -> str:
+    """
+    Extract position title from job description using Gemini
+    Can be called independently before main processing
+    """
+    try:
+        # Initialize Gemini if not already done
+        project_id = config.PROJECT_ID
+        location = config.LOCATION
+        vertexai.init(project=project_id, location=location)
+        gemini_model = GenerativeModel("gemini-2.5-flash-lite")
+        
+        prompt = f"""
+        Extract the job position/title from this job description.
+        Return ONLY the position title as plain text, nothing else.
+        
+        Examples:
+        - "Senior Data Scientist"
+        - "Backend Software Engineer - Python"
+        - "Product Manager"
+        
+        Job Description:
+        {jd_text[:2000]}
+        
+        Position Title:"""
+        
+        result = call_gemini_with_retry(prompt, gemini_model, response_type="text")
+        
+        if result:
+            # Clean up the result
+            position = result.strip().strip('"').strip("'")
+            # Limit length
+            if len(position) > 100:
+                position = position[:100]
+            return position if position else "Position Not Specified"
+        
+        return "Position Not Specified"
+        
+    except Exception as e:
+        print(f"   ⚠️ Error extracting position: {e}")
+        return "Position Not Specified"
+
+
+def detect_ai_generated_with_gemini(cv_text: str, gemini_model) -> Dict:
+    """Detect if CV is AI-generated with detailed reasoning"""
+    
+    prompt = f"""
+    Analyze if this CV is AI-generated. Consider:
+    - Repetitive patterns and formulaic language
+    - Overly polished, generic descriptions
+    - Suspiciously perfect grammar with no natural errors
+    - Buzzword-heavy content without specific details
+    - Job description phrases copied verbatim
+    - Lack of personal voice or authentic experiences
+    - Generic project descriptions that could apply to any role
+    
+    Return ONLY valid JSON:
+    {{
+        "ai_probability": <0-100>,
+        "is_likely_ai_generated": true/false,
+        "warning_level": "low", "medium", or "high",
+        "final_verdict": "Human-written" or "AI-generated",
+        "reasoning": "Detailed 2-3 sentence explanation of why you think this is AI-generated or human-written. Be specific about patterns, language use, or red flags.",
+        "red_flags": ["flag1", "flag2", ...],
+        "suspicion_indicators": {{
+            "jd_copying_detected": true/false,
+            "generic_buzzwords": true/false,
+            "lack_of_specificity": true/false,
+            "perfect_grammar": true/false,
+            "repetitive_patterns": true/false
+        }}
+    }}
+    
+    CV Text (first 2000 chars):
+    {cv_text[:2000]}
+    """
+    
+    result = call_gemini_with_retry(prompt, gemini_model, response_type="json")
+    
+    if result:
+        try:
+            data = json.loads(result)
+            return {
+                'ai_probability': data.get('ai_probability', 0),
+                'is_likely_ai_generated': data.get('is_likely_ai_generated', False),
+                'warning_level': data.get('warning_level', 'low'),
+                'final_verdict': data.get('final_verdict', 'Human-written'),
+                'reasoning': data.get('reasoning', 'No specific reasoning available'),
+                'red_flags': data.get('red_flags', []),
+                'suspicion_indicators': data.get('suspicion_indicators', {})
+            }
+        except Exception as e:
+            print(f"   ⚠️ AI detection parse error: {e}")
+    
+    return {
+        'ai_probability': 0,
+        'is_likely_ai_generated': False,
+        'warning_level': 'low',
+        'final_verdict': 'Human-written',
+        'reasoning': 'Analysis unavailable due to API error',
+        'red_flags': [],
+        'suspicion_indicators': {}
+    }
+
+
+def analyze_technical_depth_with_gemini(cv_text: str, gemini_model) -> int:
+    """Analyze technical depth of CV"""
+    
+    prompt = f"""
+    Rate the technical depth of this CV on a scale of 0-100. Consider:
+    - Depth of technical descriptions
+    - Project complexity
+    - Technical problem-solving
+    - Advanced concepts used
+    
+    Return ONLY valid JSON:
+    {{
+        "technical_depth_score": <0-100>
+    }}
+    
+    CV Text (first 1500 chars):
+    {cv_text[:1500]}
+    """
+    
+    result = call_gemini_with_retry(prompt, gemini_model, response_type="json")
+    
+    if result:
+        try:
+            data = json.loads(result)
+            return int(data.get('technical_depth_score', 50))
+        except:
+            pass
+    
+    skill_count = len(extract_skills_from_text(cv_text))
+    return min(100, skill_count * 2 + 30)
+
+
+def analyze_domain_match_with_gemini(cv_text: str, domain: str, gemini_model) -> int:
+    """Analyze domain/industry match"""
+    
+    prompt = f"""
+    Rate how well this CV matches the '{domain}' domain/industry (0-100).
+    Consider industry experience, domain knowledge, and relevant projects.
+    
+    Return ONLY valid JSON:
+    {{
+        "domain_match_score": <0-100>
+    }}
+    
+    CV Text (first 1500 chars):
+    {cv_text[:1500]}
+    """
+    
+    result = call_gemini_with_retry(prompt, gemini_model, response_type="json")
+    
+    if result:
+        try:
+            data = json.loads(result)
+            return int(data.get('domain_match_score', 50))
+        except:
+            pass
+    
+    cv_lower = cv_text.lower()
+    domain_lower = domain.lower()
+    return 75 if domain_lower in cv_lower else 50
+
+
+def generate_match_reason_with_gemini(candidate_data: Dict, gemini_model) -> str:
+    """Generate match reasoning"""
+    
+    prompt = f"""
+    Generate a brief 2-3 sentence summary explaining why this candidate matches or doesn't match the role.
+    
+    Candidate Score: {candidate_data['overall_match_percentage']:.1f}%
+    Skills Match: {candidate_data['component_scores']['skills_match']:.1f}%
+    Experience: {candidate_data['total_experience_years']} years
+    Technical Depth: {candidate_data['component_scores']['technical_depth']}/100
+    
+    Be specific and actionable. Return only the text, no JSON.
+    """
+    
+    result = call_gemini_with_retry(prompt, gemini_model, response_type="text")
+    
+    if result:
+        return result.strip()
+    
+    score = candidate_data['overall_match_percentage']
+    if score >= 70:
+        return "Strong match with excellent skills alignment and relevant experience."
+    elif score >= 50:
+        return "Moderate match with some skill gaps but transferable experience."
+    else:
+        return "Weak match with significant skill and experience gaps."
+
+
+def generate_analysis_summary(results: List[Dict], jd_requirements: Dict, position_title: str) -> str:
+    """Generate a narrative summary of the analysis"""
+    
+    total = len(results)
+    avg_score = sum(r['overall_match_percentage'] for r in results) / total if total > 0 else 0
+    
+    excellent = len([r for r in results if r['overall_match_percentage'] >= 80])
+    strong = len([r for r in results if 70 <= r['overall_match_percentage'] < 80])
+    good = len([r for r in results if 60 <= r['overall_match_percentage'] < 70])
+    moderate = len([r for r in results if 50 <= r['overall_match_percentage'] < 60])
+    weak = len([r for r in results if r['overall_match_percentage'] < 50])
+    
+    ai_detected = len([r for r in results if r.get('ai_generated_flags', {}).get('is_likely_ai_generated', False)])
+    high_risk_ai = len([r for r in results if r.get('ai_generated_flags', {}).get('warning_level', '') == 'high'])
+    
+    avg_skills_match = sum(r['component_scores'].get('skills_match', 0) for r in results) / total if total > 0 else 0
+    avg_experience = sum(r.get('total_experience_years', 0) for r in results) / total if total > 0 else 0
+    avg_tech_depth = sum(r['component_scores'].get('technical_depth', 0) for r in results) / total if total > 0 else 0
+    
+    top_candidate = results[0] if results else None
+    
+    summary = f"""RECRUITMENT ANALYSIS SUMMARY - {position_title}
+
+OVERVIEW:
+We analyzed {total} candidates for the {position_title} position, evaluating them across four key dimensions: skills match, experience alignment, technical depth, and domain expertise. Our AI-powered analysis provides both quantitative scores and qualitative insights to help you make informed hiring decisions.
+
+CANDIDATE QUALITY ASSESSMENT:
+The candidate pool shows {'exceptional' if avg_score >= 70 else 'good' if avg_score >= 60 else 'moderate' if avg_score >= 50 else 'limited'} overall quality with an average match score of {avg_score:.1f}%. """
+
+    if excellent > 0:
+        summary += f"{excellent} candidate{'s' if excellent > 1 else ''} achieved excellent scores (80%+), indicating very strong alignment with role requirements. "
+    if strong > 0:
+        summary += f"{strong} candidate{'s' if strong > 1 else ''} demonstrated strong fit (70-79%), showing solid potential for success. "
+    if good > 0:
+        summary += f"{good} candidate{'s' if good > 1 else ''} showed good alignment (60-69%), worth considering for interviews. "
+    if moderate > 0:
+        summary += f"{moderate} candidate{'s' if moderate > 1 else ''} had moderate fit (50-59%), with some skill gaps to consider. "
+    if weak > 0:
+        summary += f"{weak} candidate{'s' if weak > 1 else ''} fell below 50%, indicating significant misalignment with requirements."
+
+    summary += f"""
+
+SCORING METHODOLOGY:
+Our evaluation uses a weighted scoring system that balances multiple factors:
+• Skills Match (35% weight): Measures alignment between candidate skills and job requirements
+• Experience Match (25% weight): Evaluates years of experience and relevance to the role
+• Technical Depth (20% weight): Assesses the sophistication of technical knowledge
+• Domain Expertise (20% weight): Measures industry and domain-specific knowledge
+
+KEY FINDINGS:
+Average Skills Match: {avg_skills_match:.1f}% - {'Strong skills alignment across the candidate pool.' if avg_skills_match >= 60 else 'Moderate skills alignment with some gaps.' if avg_skills_match >= 40 else 'Significant skills gap identified.'}
+Average Experience: {avg_experience:.1f} years (Required: {jd_requirements.get('experience_required', 'N/A')} years)
+Average Technical Depth: {avg_tech_depth:.1f}/100 - {'Candidates demonstrate solid technical expertise.' if avg_tech_depth >= 65 else 'Technical depth varies across candidates.'}
+"""
+
+    if ai_detected > 0:
+        summary += f"""
+AI GENERATION ALERT:
+⚠️ {ai_detected} candidate{'s' if ai_detected > 1 else ''} flagged for potential AI-generated content. """
+        if high_risk_ai > 0:
+            summary += f"{high_risk_ai} show{'s' if high_risk_ai == 1 else ''} high-risk indicators such as JD copying, generic buzzwords, or suspiciously perfect formatting. "
+        summary += "We recommend additional scrutiny during interviews to verify authenticity of experience and skills."
+    else:
+        summary += """
+AI GENERATION CHECK:
+✓ All CVs appear to be authentically human-written with natural language patterns and genuine experiences."""
+
+    if top_candidate:
+        summary += f"""
+
+TOP CANDIDATE SPOTLIGHT:
+🏆 {top_candidate.get('candidate_name', 'Unknown')} emerged as the strongest match with a {top_candidate.get('overall_match_percentage', 0):.1f}% overall score.
+   • Current Role: {top_candidate.get('current_role', 'N/A')} at {top_candidate.get('current_company', 'N/A')}
+   • Experience: {top_candidate.get('total_experience_years', 0)} years
+   • Skills Match: {top_candidate['component_scores'].get('skills_match', 0):.1f}%
+   • Technical Depth: {top_candidate['component_scores'].get('technical_depth', 0)}/100
+   • Recommendation: {top_candidate.get('match_reason', 'Strong candidate for this role.')}
+"""
+
+    summary += f"""
+HIRING RECOMMENDATIONS:
+"""
+    if excellent + strong > 0:
+        summary += f"1. Priority Interviews: Schedule interviews immediately with the {excellent + strong} top-scoring candidates who show strong alignment.\n"
+    if good > 0:
+        summary += f"2. Secondary Consideration: Review the {good} candidates with good scores (60-69%) for backup options or alternative roles.\n"
+    if ai_detected > 0:
+        summary += f"3. Verification Required: Conduct technical assessments for the {ai_detected} candidates flagged for AI-generated content.\n"
+    
+    summary += f"""4. Skills Development: Consider candidates with high potential but specific skill gaps if you have training resources available.
+5. Market Insights: {'The strong candidate quality suggests an active talent pool - act quickly to secure top performers.' if avg_score >= 65 else 'Consider expanding search criteria or offering training opportunities to bridge skill gaps.'}
+
+CONCLUSION:
+"""
+    if avg_score >= 70:
+        summary += f"The candidate pool is excellent. You have multiple strong options who can contribute immediately. Focus on cultural fit and team dynamics in final selection."
+    elif avg_score >= 60:
+        summary += f"You have several viable candidates who meet core requirements. Interviews will help identify the best fit based on soft skills and team chemistry."
+    elif avg_score >= 50:
+        summary += f"The candidate pool shows potential but with some gaps. Consider whether you can provide training or mentorship to bridge these gaps."
+    else:
+        summary += f"Consider broadening search criteria or revisiting job requirements. Current pool shows significant misalignment with stated needs."
+    
+    return summary
+
+def generate_privacy_safe_summary(results: List[Dict], jd_requirements: Dict, position_title: str) -> str:
+    """
+    Generate a narrative summary WITHOUT PII for BigQuery storage
+    
+    This version removes:
+    - Candidate names
+    - Emails
+    - Phone numbers
+    - Company names
+    - Any identifiable information
+    
+    Used for journal_vectors storage (with embeddings)
+    """
+    
+    total = len(results)
+    avg_score = sum(r['overall_match_percentage'] for r in results) / total if total > 0 else 0
+    
+    excellent = len([r for r in results if r['overall_match_percentage'] >= 80])
+    strong = len([r for r in results if 70 <= r['overall_match_percentage'] < 80])
+    good = len([r for r in results if 60 <= r['overall_match_percentage'] < 70])
+    moderate = len([r for r in results if 50 <= r['overall_match_percentage'] < 60])
+    weak = len([r for r in results if r['overall_match_percentage'] < 50])
+    
+    ai_detected = len([r for r in results if r.get('ai_generated_flags', {}).get('is_likely_ai_generated', False)])
+    high_risk_ai = len([r for r in results if r.get('ai_generated_flags', {}).get('warning_level', '') == 'high'])
+    
+    avg_skills_match = sum(r['component_scores'].get('skills_match', 0) for r in results) / total if total > 0 else 0
+    avg_experience = sum(r.get('total_experience_years', 0) for r in results) / total if total > 0 else 0
+    avg_tech_depth = sum(r['component_scores'].get('technical_depth', 0) for r in results) / total if total > 0 else 0
+    avg_domain = sum(r['component_scores'].get('domain_relevance', 0) for r in results) / total if total > 0 else 0
+    
+    top_candidate = results[0] if results else None
+    
+    # ✅ PRIVACY-SAFE SUMMARY (NO PII)
+    summary = f"""RECRUITMENT ANALYSIS SUMMARY - {position_title}
+
+OVERVIEW:
+We analyzed {total} candidates for the {position_title} position, evaluating them across four key dimensions: skills match, experience alignment, technical depth, and domain expertise. Our AI-powered analysis provides both quantitative scores and qualitative insights to help you make informed hiring decisions.
+
+CANDIDATE QUALITY ASSESSMENT:
+The candidate pool shows {'exceptional' if avg_score >= 70 else 'good' if avg_score >= 60 else 'moderate' if avg_score >= 50 else 'limited'} overall quality with an average match score of {avg_score:.1f}%. """
+
+    if excellent > 0:
+        summary += f"{excellent} candidate{'s' if excellent > 1 else ''} achieved excellent scores (80%+), indicating very strong alignment with role requirements. "
+    if strong > 0:
+        summary += f"{strong} candidate{'s' if strong > 1 else ''} demonstrated strong fit (70-79%), showing solid potential for success. "
+    if good > 0:
+        summary += f"{good} candidate{'s' if good > 1 else ''} showed good alignment (60-69%), worth considering for interviews. "
+    if moderate > 0:
+        summary += f"{moderate} candidate{'s' if moderate > 1 else ''} had moderate fit (50-59%), with some skill gaps to consider. "
+    if weak > 0:
+        summary += f"{weak} candidate{'s' if weak > 1 else ''} fell below 50%, indicating significant misalignment with requirements."
+
+    summary += f"""
+
+SCORING METHODOLOGY:
+Our evaluation uses a weighted scoring system that balances multiple factors:
+• Skills Match (35% weight): Measures alignment between candidate skills and job requirements
+• Experience Match (25% weight): Evaluates years of experience and relevance to the role
+• Technical Depth (20% weight): Assesses the sophistication of technical knowledge
+• Domain Expertise (20% weight): Measures industry and domain-specific knowledge
+
+KEY FINDINGS:
+Average Skills Match: {avg_skills_match:.1f}% - {'Strong skills alignment across the candidate pool.' if avg_skills_match >= 60 else 'Moderate skills alignment with some gaps.' if avg_skills_match >= 40 else 'Significant skills gap identified.'}
+Average Experience: {avg_experience:.1f} years (Required: {jd_requirements.get('experience_required', 'N/A')} years)
+Average Technical Depth: {avg_tech_depth:.1f}/100 - {'Candidates demonstrate solid technical expertise.' if avg_tech_depth >= 65 else 'Technical depth varies across candidates.'}
+Average Domain Relevance: {avg_domain:.1f}/100 - {'Strong domain expertise across the pool.' if avg_domain >= 65 else 'Domain knowledge varies significantly.'}
+"""
+
+    if ai_detected > 0:
+        summary += f"""
+AI GENERATION ALERT:
+⚠️ {ai_detected} candidate{'s' if ai_detected > 1 else ''} ({ai_detected/total*100:.1f}% of pool) flagged for potential AI-generated content. """
+        if high_risk_ai > 0:
+            summary += f"{high_risk_ai} show{'s' if high_risk_ai == 1 else ''} high-risk indicators such as JD copying, generic buzzwords, or suspiciously perfect formatting. "
+        summary += "We recommend additional scrutiny during interviews to verify authenticity of experience and skills."
+    else:
+        summary += """
+AI GENERATION CHECK:
+✓ All CVs appear to be authentically human-written with natural language patterns and genuine experiences."""
+
+    # ✅ TOP CANDIDATE - NO PII (just scores and role info)
+    if top_candidate:
+        summary += f"""
+
+TOP CANDIDATE PROFILE:
+🏆 A candidate emerged as the strongest match with a {top_candidate.get('overall_match_percentage', 0):.1f}% overall score.
+   • Experience Level: {top_candidate.get('total_experience_years', 0)} years
+   • Skills Match: {top_candidate['component_scores'].get('skills_match', 0):.1f}%
+   • Technical Depth: {top_candidate['component_scores'].get('technical_depth', 0)}/100
+   • Domain Relevance: {top_candidate['component_scores'].get('domain_relevance', 0)}/100
+   • Profile Strength: {'Excellent fit for the role' if top_candidate.get('overall_match_percentage', 0) >= 75 else 'Strong candidate with minor gaps' if top_candidate.get('overall_match_percentage', 0) >= 65 else 'Solid candidate worth interviewing'}
+"""
+
+    # ✅ SKILLS ANALYSIS - AGGREGATED (NO INDIVIDUAL NAMES)
+    # Get top matched skills
+    all_matched_skills = {}
+    all_missing_skills = {}
+    
+    for r in results:
+        for skill in r.get('matched_skills', []):
+            all_matched_skills[skill] = all_matched_skills.get(skill, 0) + 1
+        for skill in r.get('missing_skills', []):
+            all_missing_skills[skill] = all_missing_skills.get(skill, 0) + 1
+    
+    # Sort by frequency
+    top_matched = sorted(all_matched_skills.items(), key=lambda x: x[1], reverse=True)[:5]
+    top_missing = sorted(all_missing_skills.items(), key=lambda x: x[1], reverse=True)[:5]
+    
+    if top_matched:
+        summary += f"""
+
+SKILLS COVERAGE:
+Most Common Matched Skills (across candidates):
+"""
+        for skill, count in top_matched:
+            pct = (count / total) * 100
+            summary += f"  • {skill}: {count}/{total} candidates ({pct:.0f}%)\n"
+    
+    if top_missing:
+        summary += f"""
+Most Common Skill Gaps:
+"""
+        for skill, count in top_missing:
+            pct = (count / total) * 100
+            summary += f"  • {skill}: Missing in {count}/{total} candidates ({pct:.0f}%)\n"
+
+    summary += f"""
+HIRING RECOMMENDATIONS:
+"""
+    if excellent + strong > 0:
+        summary += f"1. Priority Interviews: Schedule interviews immediately with the {excellent + strong} top-scoring candidates who show strong alignment.\n"
+    if good > 0:
+        summary += f"2. Secondary Consideration: Review the {good} candidates with good scores (60-69%) for backup options or alternative roles.\n"
+    if ai_detected > 0:
+        summary += f"3. Verification Required: Conduct technical assessments for the {ai_detected} candidates flagged for AI-generated content.\n"
+    
+    summary += f"""4. Skills Development: Consider candidates with high potential but specific skill gaps if you have training resources available.
+5. Market Insights: {'The strong candidate quality suggests an active talent pool - act quickly to secure top performers.' if avg_score >= 65 else 'Consider expanding search criteria or offering training opportunities to bridge skill gaps.'}
+
+CONCLUSION:
+"""
+    if avg_score >= 70:
+        summary += f"The candidate pool is excellent. You have multiple strong options who can contribute immediately. Focus on cultural fit and team dynamics in final selection."
+    elif avg_score >= 60:
+        summary += f"You have several viable candidates who meet core requirements. Interviews will help identify the best fit based on soft skills and team chemistry."
+    elif avg_score >= 50:
+        summary += f"The candidate pool shows potential but with some gaps. Consider whether you can provide training or mentorship to bridge these gaps."
+    else:
+        summary += f"Consider broadening search criteria or revisiting job requirements. Current pool shows significant misalignment with stated needs."
+    
+    return summary
+
+
+# ============================================================================
+# ADD THESE FUNCTIONS TO worker/ats_processing.py
+# ============================================================================
+# Add after the generate_privacy_safe_summary function (around line 827)
+
+def append_excel_link_to_summary(job_id: str, excel_url: str) -> str:
+    """
+    Append Excel download link to the existing summary in BigQuery
+    This avoids UPDATE on streaming buffer by appending text to existing summary
+    
+    Args:
+        job_id: Job ID to find summary
+        excel_url: Signed GCS URL for Excel download
+    
+    Returns:
+        Updated summary text with Excel link
+    """
+    from google.cloud import bigquery
+    import config
+    
+    client = bigquery.Client(project=config.PROJECT_ID)
+    
+    # Get existing summary
+    query = f"""
+    SELECT id, summary
+    FROM `{config.PROJECT_ID}.{config.BQ_DATASET}.journal_vectors`
+    WHERE id LIKE CONCAT(@job_id, '%')
+    AND source_type = 'ats_analysis'
+    ORDER BY created_at DESC
+    LIMIT 1
+    """
+    
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("job_id", "STRING", job_id)
+        ]
+    )
+    
+    results = list(client.query(query, job_config=job_config))
+    
+    if not results:
+        print(f"⚠️ No summary found for job {job_id}")
+        return None
+    
+    row = results[0]
+    existing_summary = row.summary
+    summary_id = row.id
+    
+    # Append Excel link to summary
+    excel_section = f"""
+
+📊 DETAILED ANALYSIS REPORT:
+For a comprehensive breakdown of all candidates including individual scores, skills matrices, AI detection details, and ranking comparisons, please check out our detailed findings in the Excel report attached below:
+
+📥 Download Full Report: {excel_url}
+
+This Excel report includes:
+• Executive Summary Dashboard
+• Detailed Candidate Rankings
+• Complete Skills Analysis Matrix
+• AI Detection Results
+• Experience & Technical Depth Comparisons
+• Hiring Recommendations
+
+Note: The download link is valid for 7 days. Please save the report locally for future reference.
+"""
+    
+    updated_summary = existing_summary + excel_section
+    
+    # INSERT new row with updated summary (avoid UPDATE on streaming buffer)
+    # We use a new ID with timestamp to make it unique
+    from datetime import datetime
+    new_id = f"{job_id}_summary_updated_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    
+    insert_query = f"""
+    INSERT INTO `{config.PROJECT_ID}.{config.BQ_DATASET}.journal_vectors`
+    (id, title, summary, source_type, created_at, record_date, organization_id, user_email)
+    SELECT 
+        @new_id as id,
+        title,
+        @updated_summary as summary,
+        source_type,
+        CURRENT_TIMESTAMP() as created_at,
+        CURRENT_DATE() as record_date,
+        organization_id,
+        user_email
+    FROM `{config.PROJECT_ID}.{config.BQ_DATASET}.journal_vectors`
+    WHERE id = @old_id
+    """
+    
+    insert_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("new_id", "STRING", new_id),
+            bigquery.ScalarQueryParameter("updated_summary", "STRING", updated_summary),
+            bigquery.ScalarQueryParameter("old_id", "STRING", summary_id)
+        ]
+    )
+    
+    client.query(insert_query, job_config=insert_config).result()
+    
+    print(f"✅ Summary updated with Excel link (new ID: {new_id})")
+    
+    return updated_summary
+
+
+def get_latest_summary(job_id: str) -> str:
+    """
+    Get the latest summary for a job (including any with Excel link)
+    
+    Args:
+        job_id: Job ID
+    
+    Returns:
+        Latest summary text
+    """
+    from google.cloud import bigquery
+    import config
+    
+    client = bigquery.Client(project=config.PROJECT_ID)
+    
+    query = f"""
+    SELECT summary
+    FROM `{config.PROJECT_ID}.{config.BQ_DATASET}.journal_vectors`
+    WHERE id LIKE CONCAT(@job_id, '%')
+    AND source_type = 'ats_analysis'
+    ORDER BY created_at DESC
+    LIMIT 1
+    """
+    
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("job_id", "STRING", job_id)
+        ]
+    )
+    
+    results = list(client.query(query, job_config=job_config))
+    
+    if not results:
+        return "Summary not available"
+    
+    return results[0].summary
+
+
+
+# ============================================================================
+# ANALYSIS FUNCTIONS
+# ============================================================================
+
+# def analyze_skills_match(cv_skills: List[str], required_skills: List[str]) -> Dict:
+#     """Analyze skills match between CV and JD"""
+    
+#     cv_skills_lower = [s.lower().strip() for s in cv_skills]
+#     required_skills_lower = [s.lower().strip() for s in required_skills]
+    
+#     matched = [s for s in required_skills_lower if s in cv_skills_lower]
+#     missing = [s for s in required_skills_lower if s not in cv_skills_lower]
+    
+#     match_percentage = (len(matched) / len(required_skills_lower) * 100) if required_skills_lower else 0
+    
+#     return {
+#         'skills_match_score': round(match_percentage, 2),
+#         'matched_skills': matched,
+#         'missing_skills': missing,
+#         'matched_count': len(matched),
+#         'required_count': len(required_skills_lower)
+#     }
+
+
+def analyze_single_candidate(cv_bytes: bytes, cv_filename: str, jd_text: str,
+                            jd_requirements: Dict, jd_skills: List[str],
+                            gemini_model, detect_ai: bool = True) -> Dict:
+    """Analyze a single candidate"""
+    
+    print(f"\n{'='*80}")
+    print(f"🔍 Analyzing: {cv_filename}")
+    print(f"{'='*80}\n")
+    
+    print("📄 Step 1/9: Extracting CV structure...")
+    cv_text = get_text_from_file(BytesIO(cv_bytes), Path(cv_filename).suffix)
+    
+    structure = extract_cv_structure_with_gemini(cv_text, gemini_model)
+    candidate_name = structure.get('name', 'Unknown')
+    print(f"   ✓ Name: {candidate_name}")
+    print(f"   ✓ Current Company: {structure.get('current_company', 'N/A')}")
+    print(f"   ✓ Total Experience: {structure.get('total_experience', 0)} years")
+    
+    print("\n🔧 Step 2/9: Extracting CV skills...")
+    cv_skills = extract_skills_from_text(cv_text)
+    print(f"   ✓ Skills Found: {len(cv_skills)}")
+    
+    # Extract employment history for job hopping analysis
+    employment_history = extract_employment_history_with_gemini(cv_text, gemini_model)
+    job_hopping_metrics = analyze_job_hopping(employment_history, structure.get('total_experience', 0))
+    
+    ai_flags = None
+    if detect_ai:
+        print("\n🤖 Step 3/9: AI-generated CV detection...")
+        ai_flags = detect_ai_generated_with_gemini(cv_text, gemini_model)
+        print(f"   ✓ AI Probability: {ai_flags['ai_probability']:.2f}%")
+        print(f"   ✓ Verdict: {ai_flags['final_verdict']}")
+        print(f"   ✓ Warning Level: {ai_flags['warning_level']}")
+    else:
+        print("\n🤖 Step 3/9: AI detection skipped")
+    
+    print("\n🎯 Step 4/9: Analyzing skills match...")
+    skills_result = analyze_skills_match(cv_skills, jd_skills)
+    print(f"   ✓ Skills Match: {skills_result['skills_match_score']:.1f}%")
+    print(f"   ✓ Matched Required: {skills_result['matched_count']}")
+    print(f"   ✓ Missing Critical: {len(skills_result['missing_skills'])}")
+    
+    print("\n💼 Step 5/9: Analyzing experience match...")
+    total_exp = structure.get('total_experience', 0)
+    required_exp = jd_requirements.get('experience_required', 3)
+    
+    # Handle case where no experience is required
+    if required_exp == 0:
+        # If no experience required, having any experience is 100% match
+        exp_score = 100.0 if total_exp >= 0 else 75.0
+    elif total_exp >= required_exp:
+        # Candidate has more or equal experience than required
+        exp_score = min(100, (total_exp / required_exp * 80) + 20)
+    else:
+        # Candidate has less experience than required
+        exp_score = (total_exp / required_exp * 100)
+    
+    print(f"   ✓ Experience Match: {exp_score:.1f}%")
+    print(f"   ✓ Total Years: {total_exp} (Required: {required_exp})")
+    
+    print("\n🔧 Step 6/9: Analyzing technical depth...")
+    tech_depth = analyze_technical_depth_with_gemini(cv_text, gemini_model)
+    print(f"   ✓ Technical Depth Score: {tech_depth}/100")
+    
+    print("\n🏢 Step 7/9: Analyzing domain match...")
+    domain = jd_requirements.get('domain', 'General')
+    domain_score = analyze_domain_match_with_gemini(cv_text, domain, gemini_model)
+    print(f"   ✓ Domain Match Score: {domain_score}/100")
+    
+    print("\n📊 Step 8/9: Calculating overall score...")
+    
+    component_scores = {
+        'skills_match': skills_result['skills_match_score'],
+        'experience_match': exp_score,
+        'technical_depth': tech_depth,
+        'domain_match': domain_score
+    }
+    
+    weights = {
+        'skills_match': 0.35,
+        'experience_match': 0.25,
+        'technical_depth': 0.20,
+        'domain_match': 0.20
+    }
+    
+    overall_score = sum(component_scores[key] * weights[key] for key in component_scores.keys())
+    
+    print(f"   ✓ Overall Match: {overall_score:.2f}%")
+    
+    print("\n💬 Step 9/9: Generating match reasoning...")
+    
+    result = {
+        'candidate_name': candidate_name,
+        'email': structure.get('email', ''),
+        'phone': structure.get('phone', ''),
+        'current_company': structure.get('current_company', ''),
+        'current_role': structure.get('current_role', ''),
+        'total_experience_years': total_exp,
+        'cv_filename': cv_filename,
+        'overall_match_percentage': round(overall_score, 2),
+        'component_scores': component_scores,
+        'matched_skills': skills_result['matched_skills'],
+        'missing_skills': skills_result['missing_skills'],
+        'all_cv_skills': cv_skills,
+        'ai_generated_flags': ai_flags,
+        'employment_history': employment_history,
+        'job_hopping_metrics': job_hopping_metrics
+    }
+    
+    match_reason = generate_match_reason_with_gemini(result, gemini_model)
+    result['match_reason'] = match_reason
+    print(f"   ✓ Reasoning generated")
+    
+    print(f"\n{'='*80}")
+    print(f"✅ Analysis Complete for {cv_filename}")
+    print(f"{'='*80}\n")
+    
+    return result
+
+
+# def batch_analyze_candidates(cv_files_data: List[Tuple[bytes, str]], jd_text: str,
+#                             position_title: str, organization: str, user_email: str,
+#                             detect_ai: bool = True, save_to_bigquery: bool = False,
+#                             verbose: bool = True):
+#     """Batch analyze multiple candidates"""
+    
+#     job_id = str(uuid.uuid4())
+    
+#     print(f"\n{'='*80}")
+#     print(f"📊 BATCH ANALYSIS: {len(cv_files_data)} candidates")
+#     print(f"   Job ID: {job_id}")
+#     print(f"   Position: {position_title}")
+#     print(f"   Save to BigQuery: {save_to_bigquery}")
+#     print(f"{'='*80}\n")
+    
+#     project_id = config.PROJECT_ID
+#     location = config.LOCATION
+    
+#     vertexai.init(project=project_id, location=location)
+#     gemini_model = GenerativeModel("gemini-2.5-flash-lite")
+    
+#     print("📋 Extracting JD requirements...")
+#     jd_requirements = extract_jd_requirements_with_gemini(jd_text, gemini_model)
+#     jd_skills = extract_jd_skills(jd_text, gemini_model)
+#     jd_requirements['required_skills'] = jd_skills
+    
+#     print(f"   ✓ Required Skills: {len(jd_skills)}")
+#     print(f"   ✓ Experience Required: {jd_requirements.get('experience_required', 0)} years")
+#     print(f"   ✓ Domain: {jd_requirements.get('domain', 'General')}")
+    
+#     results = []
+#     for idx, (cv_bytes, cv_filename) in enumerate(cv_files_data, 1):
+#         print(f"\n[{idx}/{len(cv_files_data)}] Processing: {cv_filename}")
+        
+#         try:
+#             result = analyze_single_candidate(
+#                 cv_bytes, cv_filename, jd_text,
+#                 jd_requirements, jd_skills,
+#                 gemini_model, detect_ai
+#             )
+#             results.append(result)
+#         except Exception as e:
+#             print(f"   ❌ Error analyzing {cv_filename}: {e}")
+#             continue
+    
+#     results.sort(key=lambda x: x['overall_match_percentage'], reverse=True)
+    
+#     print(f"\n{'='*80}")
+#     print(f"✅ Batch analysis complete: {len(results)} candidates analyzed")
+#     print(f"{'='*80}\n")
+    
+#     if save_to_bigquery:
+#         try:
+#             save_results_to_bigquery(job_id, results, jd_requirements, position_title)
+#         except Exception as e:
+#             print(f"⚠️ BigQuery save failed: {e}")
+    
+#     stats = rate_limiter.get_stats()
+#     print(f"📊 API Usage: {stats['total_requests']} requests, {stats['success_rate']:.1f}% success rate\n")
+    
+#     for result in results:
+#         result['_jd_requirements'] = jd_requirements
+#         result['_position_title'] = position_title
+    
+#     return job_id, results
+
+def batch_analyze_candidates(cv_files_data: List[Tuple[bytes, str]], jd_text: str,
+                            position_title: str, organization: str, user_email: str,
+                            detect_ai: bool = True, save_to_bigquery: bool = False,
+                            verbose: bool = True):
+    """Batch analyze multiple candidates with BigQuery integration"""
+    
+    job_id = str(uuid.uuid4())
+    total_candidates = len(cv_files_data)
+    
+    print(f"\n{'='*80}")
+    print(f"📊 BATCH ANALYSIS: {total_candidates} candidates")
+    print(f"   Job ID: {job_id}")
+    print(f"   Position: {position_title}")
+    print(f"   Save to BigQuery: {save_to_bigquery}")
+    print(f"{'='*80}\n")
+    
+    # STEP 1: Create job record with status='RUNNING' and total candidates upfront
+    if save_to_bigquery:
+        print("💾 Creating job record in BigQuery...")
+        bq_ats.insert_ats_job(job_id, position_title, organization, user_email, total_candidates)
+    
+    project_id = config.PROJECT_ID
+    location = config.LOCATION
+    
+    vertexai.init(project=project_id, location=location)
+    gemini_model = GenerativeModel("gemini-2.5-flash-lite")
+    
+    print("📋 Extracting JD requirements...")
+    jd_requirements = extract_jd_requirements_with_gemini(jd_text, gemini_model)
+    jd_skills = extract_jd_skills(jd_text, gemini_model)
+    jd_requirements['required_skills'] = jd_skills
+    
+    print(f"   ✓ Required Skills: {len(jd_skills)}")
+    print(f"   ✓ Experience Required: {jd_requirements.get('experience_required', 0)} years")
+    print(f"   ✓ Domain: {jd_requirements.get('domain', 'General')}")
+    
+    results = []
+    for idx, (cv_bytes, cv_filename) in enumerate(cv_files_data, 1):
+        print(f"\n[{idx}/{len(cv_files_data)}] Processing: {cv_filename}")
+        
+        try:
+            result = analyze_single_candidate(
+                cv_bytes, cv_filename, jd_text,
+                jd_requirements, jd_skills,
+                gemini_model, detect_ai
+            )
+            results.append(result)
+        except Exception as e:
+            print(f"   ❌ Error analyzing {cv_filename}: {e}")
+            continue
+    
+    results.sort(key=lambda x: x['overall_match_percentage'], reverse=True)
+    
+    print(f"\n{'='*80}")
+    print(f"✅ Batch analysis complete: {len(results)} candidates analyzed")
+    print(f"{'='*80}\n")
+    
+    # STEP 2: Save to BigQuery if enabled
+    if save_to_bigquery and results:
+        print("💾 Saving to BigQuery...")
+        try:
+            ################ old code commented out to avoid duplication with new functions############
+            # # Save aggregated results
+            # bq_ats.insert_ats_results(job_id, results, position_title, organization, user_email)
+            
+            # # Generate and save analysis summary
+            # #summary_text = generate_analysis_summary(results, jd_requirements, position_title)
+            # summary_text_with_pii = generate_analysis_summary(results, jd_requirements, position_title)  # For Excel
+            # summary_text_safe = generate_privacy_safe_summary(results, jd_requirements, position_title)  # For BigQuery
+            # bq_ats.insert_analysis_summary_to_journal(job_id, summary_text_safe, position_title, organization, user_email)
+            
+            # # Finalize job with status='COMPLETED' (new row, not UPDATE)
+            # bq_ats.finalize_ats_job(job_id, position_title, organization, user_email, 
+            #                         len(results), status="COMPLETED")            # ✅ GENERATE SUMMARY FIRST (before saving results)
+            summary_text_with_pii = generate_analysis_summary(results, jd_requirements, position_title)  # For Excel
+            summary_text_safe = generate_privacy_safe_summary(results, jd_requirements, position_title)  # For BigQuery
+            
+            # ✅ Save aggregated results WITH summary
+            bq_ats.insert_aggregated_ats_results(
+                job_id, 
+                results, 
+                position_title, 
+                organization, 
+                user_email,
+                summary=summary_text_safe  # ✅ Pass summary here!
+            )
+            
+            # Optional: Still save to journal_vectors for semantic search (if function exists)
+            try:
+                bq_ats.insert_analysis_summary_to_journal(job_id, summary_text_safe, position_title, organization, user_email)
+            except AttributeError:
+                print("   ⓘ  Skipping journal_vectors insert (function not available)")
+            
+            # Finalize job with status='COMPLETED'
+            bq_ats.finalize_ats_job(job_id, position_title, organization, user_email, 
+                                    len(results), status="COMPLETED")
+            
+        except Exception as e:
+            print(f"⚠️ BigQuery save failed: {e}")
+            import traceback
+            traceback.print_exc()
+            # Finalize job with status='FAILED'
+            bq_ats.finalize_ats_job(job_id, position_title, organization, user_email, 
+                                    len(results), status="FAILED", error_message=str(e))
+    
+    stats = rate_limiter.get_stats()
+    print(f"📊 API Usage: {stats['total_requests']} requests, {stats['success_rate']:.1f}% success rate\n")
+    
+    for result in results:
+        result['_jd_requirements'] = jd_requirements
+        result['_position_title'] = position_title
+    
+    return job_id, results
+
+
+# def save_results_to_bigquery(job_id: str, results: List[Dict], 
+#                             jd_requirements: Dict, position_title: str):
+#     """Save aggregated results to BigQuery"""
+    
+#     print("💾 Saving to BigQuery (aggregated data only)...")
+    
+#     try:
+#         client = bigquery.Client(project=config.PROJECT_ID)
+        
+#         aggregated = {
+#             'job_id': job_id,
+#             'analysis_date': datetime.now().isoformat(),
+#             'position': position_title,
+#             'candidates_analyzed': len(results),
+#             'avg_match_score': sum(r['overall_match_percentage'] for r in results) / len(results) if results else 0,
+#             'top_match_score': max((r['overall_match_percentage'] for r in results), default=0),
+#             'candidates_above_70': len([r for r in results if r['overall_match_percentage'] >= 70]),
+#             'candidates_above_60': len([r for r in results if r['overall_match_percentage'] >= 60]),
+#         }
+        
+#         table_id = f"{config.PROJECT_ID}.{config.BQ_DATASET}.ats_results"
+#         errors = client.insert_rows_json(table_id, [aggregated])
+        
+#         if errors:
+#             print(f"   ❌ Error: {errors}")
+#         else:
+#             print(f"   ✅ Saved successfully")
+    
+#     except Exception as e:
+#         print(f"   ⚠️ Error: {e}")
+
+
+# ============================================================================
+# EXCEL EXPORT
+# ============================================================================
+
+def export_analysis_to_excel(results: List[Dict], output_file: str, 
+                            jd_requirements: Dict = None, position_title: str = "Unknown Position"):
+    """Export analysis to Excel with 5 sheets"""
+    
+    if not results:
+        print("⚠️ No results to export")
+        return
+    
+    if not jd_requirements and results:
+        jd_requirements = results[0].get('_jd_requirements', {})
+    if position_title == "Unknown Position" and results:
+        position_title = results[0].get('_position_title', 'Unknown Position')
+    
+    wb = Workbook()
+    
+    if 'Sheet' in wb.sheetnames:
+        wb.remove(wb['Sheet'])
+    
+    all_jd_skills = []
+    for result in results:
+        all_jd_skills.extend(result.get('matched_skills', []))
+        all_jd_skills.extend(result.get('missing_skills', []))
+    jd_skills = list(set(all_jd_skills))
+    jd_skills.sort()
+    
+    print("   📄 Creating Summary page...")
+    create_summary_page(wb, results, jd_requirements or {}, position_title)
+    
+    print("   📄 Creating Candidate Rankings...")
+    create_candidate_rankings_sheet(wb, results)
+    
+    print("   📄 Creating Skills Analysis...")
+    create_skills_analysis_sheet(wb, results)
+    
+    print("   📄 Creating AI Detection Analysis...")
+    create_ai_detection_detailed_sheet(wb, results)
+    
+    print("   📄 Creating Job Hopping Analysis...")
+    create_job_hopping_sheet(wb, results)
+    
+    print("   📄 Creating Skills Matrix...")
+    create_skills_matrix_sheet(wb, results, jd_skills)
+    
+    wb.save(output_file)
+    print(f"✅ Analysis exported to: {output_file}")
+    print(f"\n📊 Excel file contains 6 sheets:")
+    print(f"   1. Summary - Comprehensive analysis story")
+    print(f"   2. Candidate Rankings - Complete scores")
+    print(f"   3. Skills Analysis - Detailed matching")
+    print(f"   4. AI Detection Analysis - With reasoning")
+    print(f"   5. Job Hopping Analysis - Stability assessment")
+    print(f"   6. Skills Matrix - Visual ✓/✗ comparison")
+
+
+def create_summary_page(wb: Workbook, results: List[Dict], jd_requirements: Dict, position_title: str):
+    """Create comprehensive summary page"""
+    
+    ws = wb.create_sheet("Summary", 0)
+    
+    narrative = generate_analysis_summary(results, jd_requirements, position_title)
+    
+    ws.column_dimensions['A'].width = 120
+    
+    ws['A1'] = "RECRUITMENT ANALYSIS REPORT"
+    ws['A1'].font = Font(bold=True, size=16, color="FFFFFF")
+    ws['A1'].fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+    ws['A1'].alignment = Alignment(horizontal='center', vertical='center')
+    ws.merge_cells('A1:A2')
+    
+    row = 3
+    
+    ws[f'A{row}'] = f"Position: {position_title}"
+    ws[f'A{row}'].font = Font(bold=True, size=12)
+    row += 1
+    
+    ws[f'A{row}'] = f"Analysis Date: {datetime.now().strftime('%B %d, %Y at %I:%M %p')}"
+    ws[f'A{row}'].font = Font(italic=True, size=10)
+    row += 2
+    
+    ws[f'A{row}'] = "📊 QUICK STATISTICS"
+    ws[f'A{row}'].font = Font(bold=True, size=14, color="4472C4")
+    row += 1
+    
+    total = len(results)
+    avg_score = sum(r['overall_match_percentage'] for r in results) / total if total > 0 else 0
+    above_70 = len([r for r in results if r['overall_match_percentage'] >= 70])
+    above_60 = len([r for r in results if r['overall_match_percentage'] >= 60])
+    ai_detected = len([r for r in results if r.get('ai_generated_flags', {}).get('is_likely_ai_generated', False)])
+    
+    stats = [
+        ("Total Candidates Analyzed", total),
+        ("Average Match Score", f"{avg_score:.1f}%"),
+        ("Candidates Above 70% (Strong Match)", above_70),
+        ("Candidates Above 60% (Good Match)", above_60),
+        ("AI-Generated CVs Detected", ai_detected),
+        ("Top Match Score", f"{max((r['overall_match_percentage'] for r in results), default=0):.1f}%"),
+    ]
+    
+    for label, value in stats:
+        ws[f'A{row}'] = f"  • {label}: {value}"
+        ws[f'A{row}'].font = Font(size=11)
+        row += 1
+    
+    row += 1
+    
+    ws[f'A{row}'] = "⚖️ SCORING METHODOLOGY"
+    ws[f'A{row}'].font = Font(bold=True, size=14, color="4472C4")
+    row += 1
+    
+    methodology = [
+        "Skills Match (35% weight) - Alignment between candidate skills and job requirements",
+        "Experience Match (25% weight) - Years of experience and relevance to the role",
+        "Technical Depth (20% weight) - Sophistication of technical knowledge",
+        "Domain Expertise (20% weight) - Industry and domain-specific knowledge",
+    ]
+    
+    for item in methodology:
+        ws[f'A{row}'] = f"  • {item}"
+        ws[f'A{row}'].font = Font(size=10)
+        row += 1
+    
+    row += 2
+    
+    ws[f'A{row}'] = "📋 DETAILED ANALYSIS"
+    ws[f'A{row}'].font = Font(bold=True, size=14, color="4472C4")
+    row += 1
+    
+    paragraphs = narrative.split('\n\n')
+    for paragraph in paragraphs:
+        if paragraph.strip():
+            if paragraph.strip().endswith(':') and len(paragraph.strip()) < 50:
+                ws[f'A{row}'] = paragraph.strip()
+                ws[f'A{row}'].font = Font(bold=True, size=11, color="2E5C8A")
+                row += 1
+            else:
+                ws[f'A{row}'] = paragraph.strip()
+                ws[f'A{row}'].font = Font(size=10)
+                ws[f'A{row}'].alignment = Alignment(wrap_text=True, vertical='top')
+                ws.row_dimensions[row].height = None
+                row += 1
+            row += 1
+    
+    row += 1
+    ws[f'A{row}'] = "🏆 TOP 3 CANDIDATES AT A GLANCE"
+    ws[f'A{row}'].font = Font(bold=True, size=14, color="4472C4")
+    row += 1
+    
+    for idx, result in enumerate(results[:3], 1):
+        medal = "🥇" if idx == 1 else "🥈" if idx == 2 else "🥉"
+        candidate_summary = f"{medal} {idx}. {result.get('candidate_name', 'Unknown')} - {result.get('overall_match_percentage', 0):.1f}%"
+        ws[f'A{row}'] = candidate_summary
+        ws[f'A{row}'].font = Font(bold=True, size=11)
+        row += 1
+        
+        details = f"      {result.get('current_role', 'N/A')} at {result.get('current_company', 'N/A')} | "
+        details += f"{result.get('total_experience_years', 0)} years exp | "
+        details += f"Skills: {result['component_scores'].get('skills_match', 0):.0f}% | "
+        details += f"Tech: {result['component_scores'].get('technical_depth', 0)}/100"
+        
+        ws[f'A{row}'] = details
+        ws[f'A{row}'].font = Font(size=9, italic=True)
+        row += 1
+        row += 1
+
+
+def create_candidate_rankings_sheet(wb: Workbook, results: List[Dict]):
+    """Create candidate rankings sheet"""
+    
+    ws = wb.create_sheet("Candidate Rankings")
+    
+    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+    header_font = Font(bold=True, color="FFFFFF", size=11)
+    
+    headers = [
+        'Rank', 'Candidate Name', 'Overall Match (%)', 'Email', 'Phone',
+        'Current Company', 'Experience (Years)', 'Skills Match (%)',
+        'Experience Score (%)', 'Technical Depth', 'Domain Match (%)',
+        'Recommendation', 'AI Detection'
+    ]
+    
+    for col_idx, header in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col_idx, value=header)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    
+    for row_idx, result in enumerate(results, 2):
+        ws.cell(row=row_idx, column=1, value=row_idx - 1)
+        ws.cell(row=row_idx, column=2, value=result.get('candidate_name', 'Unknown'))
+        ws.cell(row=row_idx, column=3, value=round(result.get('overall_match_percentage', 0), 1))
+        ws.cell(row=row_idx, column=4, value=result.get('email', ''))
+        ws.cell(row=row_idx, column=5, value=result.get('phone', ''))
+        ws.cell(row=row_idx, column=6, value=result.get('current_company', ''))
+        ws.cell(row=row_idx, column=7, value=result.get('total_experience_years', 0))
+        ws.cell(row=row_idx, column=8, value=round(result['component_scores'].get('skills_match', 0), 1))
+        ws.cell(row=row_idx, column=9, value=round(result['component_scores'].get('experience_match', 0), 1))
+        ws.cell(row=row_idx, column=10, value=result['component_scores'].get('technical_depth', 0))
+        ws.cell(row=row_idx, column=11, value=round(result['component_scores'].get('domain_match', 0), 1))
+        
+        score = result.get('overall_match_percentage', 0)
+        if score >= 70:
+            recommendation = "Highly Recommended"
+        elif score >= 60:
+            recommendation = "Recommended"
+        elif score >= 50:
+            recommendation = "Consider"
+        else:
+            recommendation = "Not Recommended"
+        ws.cell(row=row_idx, column=12, value=recommendation)
+        
+        ai_flags = result.get('ai_generated_flags')
+        if ai_flags:
+            ai_verdict = f"{ai_flags.get('final_verdict', 'N/A')} ({ai_flags.get('warning_level', 'low')})"
+        else:
+            ai_verdict = "Not analyzed"
+        ws.cell(row=row_idx, column=13, value=ai_verdict)
+    
+    for col_idx in range(1, len(headers) + 1):
+        col_letter = get_column_letter(col_idx)
+        ws.column_dimensions[col_letter].width = 18
+
+
+def create_skills_analysis_sheet(wb: Workbook, results: List[Dict]):
+    """Create skills analysis sheet"""
+    
+    ws = wb.create_sheet("Skills Analysis")
+    
+    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+    header_font = Font(bold=True, color="FFFFFF", size=11)
+    
+    headers = ['Rank', 'Candidate Name', 'Matched Skills', 'Missing Skills', 'Skills Match (%)']
+    
+    for col_idx, header in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col_idx, value=header)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    
+    for row_idx, result in enumerate(results, 2):
+        ws.cell(row=row_idx, column=1, value=row_idx - 1)
+        ws.cell(row=row_idx, column=2, value=result.get('candidate_name', 'Unknown'))
+        
+        matched = ', '.join(result.get('matched_skills', [])[:10])
+        if len(result.get('matched_skills', [])) > 10:
+            matched += f" ... (+{len(result.get('matched_skills', [])) - 10} more)"
+        ws.cell(row=row_idx, column=3, value=matched)
+        
+        missing = ', '.join(result.get('missing_skills', [])[:10])
+        if len(result.get('missing_skills', [])) > 10:
+            missing += f" ... (+{len(result.get('missing_skills', [])) - 10} more)"
+        ws.cell(row=row_idx, column=4, value=missing)
+        
+        ws.cell(row=row_idx, column=5, value=round(result['component_scores'].get('skills_match', 0), 1))
+    
+    ws.column_dimensions['A'].width = 8
+    ws.column_dimensions['B'].width = 25
+    ws.column_dimensions['C'].width = 50
+    ws.column_dimensions['D'].width = 50
+    ws.column_dimensions['E'].width = 15
+
+
+def create_ai_detection_detailed_sheet(wb: Workbook, results: List[Dict]):
+    """Create detailed AI detection sheet"""
+    
+    ws = wb.create_sheet("AI Detection Analysis")
+    
+    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+    header_font = Font(bold=True, color="FFFFFF", size=11)
+    high_risk_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+    medium_risk_fill = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
+    low_risk_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+    
+    headers = [
+        'Rank', 'Candidate Name', 'AI Probability (%)', 'Verdict', 
+        'Warning Level', 'Detailed Reasoning', 'Red Flags', 
+        'JD Copying', 'Generic Buzzwords', 'Lacks Specificity'
+    ]
+    
+    for col_idx, header in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col_idx, value=header)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    
+    for row_idx, result in enumerate(results, 2):
+        ws.cell(row=row_idx, column=1, value=row_idx - 1)
+        ws.cell(row=row_idx, column=2, value=result.get('candidate_name', 'Unknown'))
+        
+        ai_flags = result.get('ai_generated_flags')
+        if ai_flags:
+            prob_cell = ws.cell(row=row_idx, column=3, value=round(ai_flags.get('ai_probability', 0), 1))
+            verdict_cell = ws.cell(row=row_idx, column=4, value=ai_flags.get('final_verdict', 'N/A'))
+            
+            warning_level = ai_flags.get('warning_level', 'low')
+            warning_cell = ws.cell(row=row_idx, column=5, value=warning_level.upper())
+            warning_cell.font = Font(bold=True)
+            
+            if warning_level == 'high':
+                warning_cell.fill = high_risk_fill
+                prob_cell.fill = high_risk_fill
+                verdict_cell.fill = high_risk_fill
+            elif warning_level == 'medium':
+                warning_cell.fill = medium_risk_fill
+                prob_cell.fill = medium_risk_fill
+                verdict_cell.fill = medium_risk_fill
+            else:
+                warning_cell.fill = low_risk_fill
+                prob_cell.fill = low_risk_fill
+                verdict_cell.fill = low_risk_fill
+            
+            reasoning_cell = ws.cell(row=row_idx, column=6, value=ai_flags.get('reasoning', 'No reasoning provided'))
+            reasoning_cell.alignment = Alignment(wrap_text=True, vertical='top')
+            
+            red_flags = ', '.join(ai_flags.get('red_flags', []))
+            ws.cell(row=row_idx, column=7, value=red_flags if red_flags else 'None')
+            
+            indicators = ai_flags.get('suspicion_indicators', {})
+            ws.cell(row=row_idx, column=8, value='YES' if indicators.get('jd_copying_detected') else 'NO')
+            ws.cell(row=row_idx, column=9, value='YES' if indicators.get('generic_buzzwords') else 'NO')
+            ws.cell(row=row_idx, column=10, value='YES' if indicators.get('lack_of_specificity') else 'NO')
+            
+        else:
+            for col in range(3, 11):
+                ws.cell(row=row_idx, column=col, value="Not analyzed")
+    
+    ws.column_dimensions['A'].width = 8
+    ws.column_dimensions['B'].width = 25
+    ws.column_dimensions['C'].width = 15
+    ws.column_dimensions['D'].width = 18
+    ws.column_dimensions['E'].width = 15
+    ws.column_dimensions['F'].width = 60
+    ws.column_dimensions['G'].width = 40
+    ws.column_dimensions['H'].width = 12
+    ws.column_dimensions['I'].width = 18
+    ws.column_dimensions['J'].width = 18
+
+
+def create_skills_matrix_sheet(wb: Workbook, results: List[Dict], jd_skills: List[str]):
+    """Create skills matrix sheet with checkmarks"""
+    
+    ws = wb.create_sheet("Skills Matrix")
+    
+    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+    header_font = Font(bold=True, color="FFFFFF", size=11)
+    green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+    red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+    yellow_fill = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
+    
+    border = Border(
+        left=Side(style='thin'),
+        right=Side(style='thin'),
+        top=Side(style='thin'),
+        bottom=Side(style='thin')
+    )
+    
+    headers = ['CV ID'] + jd_skills + ['Total Matches', 'Match %']
+    
+    for col_idx, header in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col_idx, value=header)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+        cell.border = border
+    
+    for row_idx, result in enumerate(results, 2):
+        candidate_name = result.get('candidate_name', 'Unknown')
+        cv_skills = [s.lower().strip() for s in result.get('all_cv_skills', [])]
+        
+        cell = ws.cell(row=row_idx, column=1, value=candidate_name)
+        cell.border = border
+        cell.alignment = Alignment(horizontal='left', vertical='center')
+        cell.font = Font(bold=True)
+        
+        matches = 0
+        for col_idx, skill in enumerate(jd_skills, 2):
+            skill_lower = skill.lower().strip()
+            has_skill = skill_lower in cv_skills
+            
+            cell = ws.cell(row=row_idx, column=col_idx, value='✓' if has_skill else '✗')
+            cell.border = border
+            cell.alignment = Alignment(horizontal='center', vertical='center')
+            
+            if has_skill:
+                cell.fill = green_fill
+                cell.font = Font(color="006100", bold=True, size=12)
+                matches += 1
+            else:
+                cell.fill = red_fill
+                cell.font = Font(color="9C0006", size=12)
+        
+        total_col = len(headers) - 1
+        cell = ws.cell(row=row_idx, column=total_col, value=matches)
+        cell.border = border
+        cell.alignment = Alignment(horizontal='center', vertical='center')
+        cell.font = Font(bold=True, size=11)
+        
+        match_pct = (matches / len(jd_skills) * 100) if jd_skills else 0
+        match_pct_str = f"{match_pct:.1f}%"
+        
+        cell = ws.cell(row=row_idx, column=len(headers), value=match_pct_str)
+        cell.border = border
+        cell.alignment = Alignment(horizontal='center', vertical='center')
+        cell.font = Font(bold=True, size=11)
+        
+        if match_pct >= 70:
+            cell.fill = green_fill
+            cell.font = Font(color="006100", bold=True, size=11)
+        elif match_pct >= 50:
+            cell.fill = yellow_fill
+            cell.font = Font(color="9C5700", bold=True, size=11)
+        else:
+            cell.fill = red_fill
+            cell.font = Font(color="9C0006", bold=True, size=11)
+    
+    ws.column_dimensions['A'].width = 25
+    for col_idx in range(2, len(headers)):
+        col_letter = get_column_letter(col_idx)
+        ws.column_dimensions[col_letter].width = 15
+    
+    ws.column_dimensions[get_column_letter(len(headers) - 1)].width = 15
+    ws.column_dimensions[get_column_letter(len(headers))].width = 12
+    
+    ws.freeze_panes = 'B2'
+
+
+def create_job_hopping_sheet(wb: Workbook, results: List[Dict]):
+    """Create job hopping analysis sheet"""
+    
+    ws = wb.create_sheet("Job Hopping Analysis")
+    
+    # Define styles
+    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+    header_font = Font(bold=True, color="FFFFFF", size=11)
+    green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+    yellow_fill = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
+    red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+    gray_fill = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
+    
+    border = Border(
+        left=Side(style='thin'),
+        right=Side(style='thin'),
+        top=Side(style='thin'),
+        bottom=Side(style='thin')
+    )
+    
+    # Title
+    ws['A1'] = 'JOB HOPPING & STABILITY ANALYSIS'
+    ws['A1'].font = Font(bold=True, size=14, color="FFFFFF")
+    ws['A1'].fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+    ws['A1'].alignment = Alignment(horizontal='center', vertical='center')
+    ws.merge_cells('A1:K1')
+    ws.row_dimensions[1].height = 25
+    
+    # Headers
+    headers = [
+        'Candidate Name',
+        'Total Experience (Years)',
+        'Total Jobs',
+        'Job Changes',
+        'Avg Tenure (Months)',
+        'Avg Tenure (Years)',
+        'Jobs/Year',
+        'Stability Score',
+        'Risk Level',
+        'Assessment',
+        'Recommendation'
+    ]
+    
+    for col_idx, header in enumerate(headers, 1):
+        cell = ws.cell(row=2, column=col_idx, value=header)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+        cell.border = border
+    
+    ws.row_dimensions[2].height = 30
+    
+    # Data rows
+    for row_idx, result in enumerate(results, 3):
+        candidate_name = result.get('candidate_name', 'Unknown')
+        total_exp = result.get('total_experience_years', 0)
+        job_metrics = result.get('job_hopping_metrics', {})
+        
+        # Extract metrics
+        total_jobs = job_metrics.get('total_jobs', 0)
+        job_changes = job_metrics.get('job_changes', 0)
+        avg_tenure_months = job_metrics.get('average_tenure_months', 0)
+        avg_tenure_years = job_metrics.get('average_tenure_years', 0)
+        jobs_per_year = job_metrics.get('jobs_per_year', 0)
+        stability_score = job_metrics.get('stability_score', 50)
+        risk_level = job_metrics.get('risk_level', 'Unknown')
+        risk_color = job_metrics.get('risk_color', 'gray')
+        assessment = job_metrics.get('assessment', 'N/A')
+        recommendation = job_metrics.get('recommendation', 'N/A')
+        
+        # Candidate Name
+        cell = ws.cell(row=row_idx, column=1, value=candidate_name)
+        cell.border = border
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal='left', vertical='center')
+        
+        # Total Experience
+        cell = ws.cell(row=row_idx, column=2, value=total_exp)
+        cell.border = border
+        cell.alignment = Alignment(horizontal='center', vertical='center')
+        cell.number_format = '0.0'
+        
+        # Total Jobs
+        cell = ws.cell(row=row_idx, column=3, value=total_jobs)
+        cell.border = border
+        cell.alignment = Alignment(horizontal='center', vertical='center')
+        
+        # Job Changes
+        cell = ws.cell(row=row_idx, column=4, value=job_changes)
+        cell.border = border
+        cell.alignment = Alignment(horizontal='center', vertical='center')
+        
+        # Avg Tenure (Months)
+        cell = ws.cell(row=row_idx, column=5, value=avg_tenure_months)
+        cell.border = border
+        cell.alignment = Alignment(horizontal='center', vertical='center')
+        cell.number_format = '0.0'
+        
+        # Avg Tenure (Years)
+        cell = ws.cell(row=row_idx, column=6, value=avg_tenure_years)
+        cell.border = border
+        cell.alignment = Alignment(horizontal='center', vertical='center')
+        cell.number_format = '0.00'
+        
+        # Jobs/Year
+        cell = ws.cell(row=row_idx, column=7, value=jobs_per_year)
+        cell.border = border
+        cell.alignment = Alignment(horizontal='center', vertical='center')
+        cell.number_format = '0.00'
+        
+        # Stability Score
+        cell = ws.cell(row=row_idx, column=8, value=stability_score)
+        cell.border = border
+        cell.alignment = Alignment(horizontal='center', vertical='center')
+        cell.font = Font(bold=True, size=11)
+        
+        # Apply color based on score
+        if stability_score >= 75:
+            cell.fill = green_fill
+            cell.font = Font(bold=True, size=11, color="006100")
+        elif stability_score >= 50:
+            cell.fill = yellow_fill
+            cell.font = Font(bold=True, size=11, color="9C5700")
+        elif stability_score > 0:
+            cell.fill = red_fill
+            cell.font = Font(bold=True, size=11, color="9C0006")
+        else:
+            cell.fill = gray_fill
+        
+        # Risk Level
+        cell = ws.cell(row=row_idx, column=9, value=risk_level)
+        cell.border = border
+        cell.alignment = Alignment(horizontal='center', vertical='center')
+        cell.font = Font(bold=True)
+        
+        # Apply risk level color
+        if risk_color == 'green':
+            cell.fill = green_fill
+            cell.font = Font(bold=True, color="006100")
+        elif risk_color == 'yellow':
+            cell.fill = yellow_fill
+            cell.font = Font(bold=True, color="9C5700")
+        elif risk_color == 'red':
+            cell.fill = red_fill
+            cell.font = Font(bold=True, color="9C0006")
+        else:
+            cell.fill = gray_fill
+        
+        # Assessment
+        cell = ws.cell(row=row_idx, column=10, value=assessment)
+        cell.border = border
+        cell.alignment = Alignment(horizontal='left', vertical='center', wrap_text=True)
+        
+        # Recommendation
+        cell = ws.cell(row=row_idx, column=11, value=recommendation)
+        cell.border = border
+        cell.alignment = Alignment(horizontal='left', vertical='center', wrap_text=True)
+        
+        ws.row_dimensions[row_idx].height = 40
+    
+    # Column widths
+    ws.column_dimensions['A'].width = 25
+    ws.column_dimensions['B'].width = 12
+    ws.column_dimensions['C'].width = 12
+    ws.column_dimensions['D'].width = 12
+    ws.column_dimensions['E'].width = 14
+    ws.column_dimensions['F'].width = 14
+    ws.column_dimensions['G'].width = 12
+    ws.column_dimensions['H'].width = 14
+    ws.column_dimensions['I'].width = 14
+    ws.column_dimensions['J'].width = 50
+    ws.column_dimensions['K'].width = 50
+    
+    ws.freeze_panes = 'A3'
+    
+    # Add summary statistics at the bottom
+    summary_row = len(results) + 4
+    
+    ws[f'A{summary_row}'] = 'SUMMARY STATISTICS'
+    ws[f'A{summary_row}'].font = Font(bold=True, size=12)
+    ws[f'A{summary_row}'].fill = PatternFill(start_color="E7E6E6", end_color="E7E6E6", fill_type="solid")
+    ws.merge_cells(f'A{summary_row}:K{summary_row}')
+    
+    summary_row += 1
+    
+    # Calculate summary stats
+    low_risk = sum(1 for r in results if r.get('job_hopping_metrics', {}).get('risk_level') == 'Low Risk')
+    medium_risk = sum(1 for r in results if r.get('job_hopping_metrics', {}).get('risk_level') == 'Medium Risk')
+    high_risk = sum(1 for r in results if r.get('job_hopping_metrics', {}).get('risk_level') == 'High Risk')
+    total_candidates = len(results)
+    
+    avg_stability = sum(r.get('job_hopping_metrics', {}).get('stability_score', 0) for r in results) / total_candidates if total_candidates > 0 else 0
+    avg_tenure = sum(r.get('job_hopping_metrics', {}).get('average_tenure_years', 0) for r in results) / total_candidates if total_candidates > 0 else 0
+    
+    ws[f'A{summary_row}'] = f'Total Candidates: {total_candidates}'
+    ws[f'E{summary_row}'] = f'Low Risk: {low_risk} ({low_risk/total_candidates*100:.1f}%)' if total_candidates > 0 else 'Low Risk: 0'
+    if low_risk > 0:
+        ws[f'E{summary_row}'].fill = green_fill
+    
+    summary_row += 1
+    ws[f'A{summary_row}'] = f'Average Stability Score: {avg_stability:.1f}'
+    ws[f'E{summary_row}'] = f'Medium Risk: {medium_risk} ({medium_risk/total_candidates*100:.1f}%)' if total_candidates > 0 else 'Medium Risk: 0'
+    if medium_risk > 0:
+        ws[f'E{summary_row}'].fill = yellow_fill
+    
+    summary_row += 1
+    ws[f'A{summary_row}'] = f'Average Tenure: {avg_tenure:.2f} years'
+    ws[f'E{summary_row}'] = f'High Risk: {high_risk} ({high_risk/total_candidates*100:.1f}%)' if total_candidates > 0 else 'High Risk: 0'
+    if high_risk > 0:
+        ws[f'E{summary_row}'].fill = red_fill
+
+
+
+# ============================================================================
+# USAGE EXAMPLE
+# ============================================================================
+"""
+In ats_upload.py, after generating Excel and getting signed URL:
+
+    # Generate Excel, upload to GCS, get signed URL
+    report_url = "https://storage.googleapis.com/..."
+    
+    # Append Excel link to summary in BigQuery
+    if save_to_bigquery and report_url:
+        try:
+            from worker.ats_processing import append_excel_link_to_summary
+            summary = append_excel_link_to_summary(job_id, report_url)
+            print(f"✅ Summary updated with Excel link")
+        except Exception as e:
+            print(f"⚠️ Failed to update summary: {e}")
+            # Get summary without link as fallback
+            from worker.ats_processing import get_latest_summary
+            summary = get_latest_summary(job_id)
+    
+    # Return in API response
+    return {
+        "job_id": job_id,
+        "report_url": report_url,
+        "summary": summary,  # ← Includes Excel link!
+        ...
+    }
+"""
+
+# ============================================================================
+# MODULE INITIALIZATION
+# ============================================================================
+
+print("\n" + "="*80)
+print("✅ ATS PROCESSING MODULE LOADED - CLEAN VERSION")
+print("="*80)
+print("\n📚 Available Functions:")
+print("  • batch_analyze_candidates() - Main batch analysis")
+print("  • analyze_single_candidate() - Single candidate analysis")
+print("  • export_analysis_to_excel() - Excel export with 6 sheets")
+print("\n💡 Features:")
+print("  ✓ Summary page with analysis story")
+print("  ✓ Detailed AI detection with reasoning")
+print("  ✓ Job hopping & stability analysis")
+print("  ✓ Skills matrix with ✓/✗ indicators")
+print("  ✓ Rate limiting (8 req/min)")
+print("  ✓ Exponential backoff retry")
+print("  ✓ BigQuery integration")
+print("\n🚀 Ready to process candidates!")
+print("="*80 + "\n")

@@ -1,0 +1,1039 @@
+# utils/bigquery_ats_utils.py
+"""
+BigQuery utilities for ATS Checker
+PRIVACY-COMPLIANT: No PII storage, only aggregated analytics
+Stores learning insights in journal_vectors for knowledge building
+"""
+
+import config
+from google.cloud import bigquery
+from datetime import datetime
+from google.api_core import exceptions as google_exceptions
+import json
+import hashlib
+
+# --- BigQuery Client Initialization ---
+client = bigquery.Client(project=config.PROJECT_ID)
+
+# --- Table Definitions ---
+DATASET_ID = f"{config.PROJECT_ID}.{config.BQ_DATASET}"
+ATS_JOBS_TABLE = f"{DATASET_ID}.ats_jobs"
+ATS_RESULTS_TABLE = f"{DATASET_ID}.ats_results"
+JOURNAL_VECTORS_TABLE = f"{DATASET_ID}.journal_vectors"  # Reuse existing table
+
+# ==================== Table Schema Definitions ====================
+
+def ensure_ats_tables():
+    """
+    Ensure required ATS BigQuery tables exist.
+    NO PII STORAGE - Only aggregated analytics and learning insights
+    """
+    
+    # Check if dataset exists
+    try:
+        client.get_dataset(DATASET_ID)
+        print(f"✅ Dataset {DATASET_ID} exists")
+    except google_exceptions.NotFound:
+        print(f"⚠️  Dataset {DATASET_ID} not found. Creating...")
+        dataset = bigquery.Dataset(DATASET_ID)
+        dataset.location = config.LOCATION
+        client.create_dataset(dataset, timeout=30)
+        print(f"✅ Created dataset {DATASET_ID}")
+    
+    # Define schemas
+    schemas = {
+        "ats_jobs": [
+            # Job metadata only
+            bigquery.SchemaField("job_id", "STRING", mode="REQUIRED"),
+            bigquery.SchemaField("position_title", "STRING", mode="NULLABLE"),
+            bigquery.SchemaField("organization", "STRING", mode="NULLABLE"),
+            bigquery.SchemaField("user_email", "STRING", mode="NULLABLE"),  # Client user only
+            bigquery.SchemaField("total_candidates_analyzed", "INTEGER", mode="NULLABLE"),
+            bigquery.SchemaField("status", "STRING", mode="NULLABLE"),
+            bigquery.SchemaField("created_at", "TIMESTAMP", mode="NULLABLE"),
+            bigquery.SchemaField("updated_at", "TIMESTAMP", mode="NULLABLE"),
+            bigquery.SchemaField("completed_at", "TIMESTAMP", mode="NULLABLE"),
+            bigquery.SchemaField("record_date", "DATE", mode="NULLABLE"),
+            bigquery.SchemaField("record_date_str", "STRING", mode="NULLABLE"),
+            bigquery.SchemaField("report_url", "STRING", mode="NULLABLE"),
+            bigquery.SchemaField("error_message", "STRING", mode="NULLABLE"),
+            bigquery.SchemaField("meta", "STRING", mode="NULLABLE"),
+        ],
+        
+        "ats_results": [
+            # Aggregated results ONLY - NO PII
+            bigquery.SchemaField("result_id", "STRING", mode="REQUIRED"),
+            bigquery.SchemaField("job_id", "STRING", mode="NULLABLE"),
+            bigquery.SchemaField("created_at", "TIMESTAMP", mode="NULLABLE"),
+            bigquery.SchemaField("record_date", "DATE", mode="NULLABLE"),
+            bigquery.SchemaField("record_date_str", "STRING", mode="NULLABLE"),
+            
+            # Aggregated Statistics (NO INDIVIDUAL DATA)
+            bigquery.SchemaField("total_candidates", "INTEGER", mode="NULLABLE"),
+            bigquery.SchemaField("avg_match_percentage", "FLOAT", mode="NULLABLE"),
+            bigquery.SchemaField("median_match_percentage", "FLOAT", mode="NULLABLE"),
+            bigquery.SchemaField("max_match_percentage", "FLOAT", mode="NULLABLE"),
+            bigquery.SchemaField("min_match_percentage", "FLOAT", mode="NULLABLE"),
+            
+            # Match Distribution
+            bigquery.SchemaField("high_match_count", "INTEGER", mode="NULLABLE"),  # ≥70%
+            bigquery.SchemaField("medium_match_count", "INTEGER", mode="NULLABLE"),  # 50-69%
+            bigquery.SchemaField("low_match_count", "INTEGER", mode="NULLABLE"),  # <50%
+            
+            # Skills Analysis (Aggregated)
+            bigquery.SchemaField("avg_skills_match", "FLOAT", mode="NULLABLE"),
+            bigquery.SchemaField("most_common_missing_skills", "STRING", mode="REPEATED"),
+            bigquery.SchemaField("most_common_found_skills", "STRING", mode="REPEATED"),
+            
+            # Experience Analysis (Aggregated)
+            bigquery.SchemaField("avg_experience_match", "FLOAT", mode="NULLABLE"),
+            bigquery.SchemaField("avg_candidate_experience_years", "FLOAT", mode="NULLABLE"),
+            
+            # AI Detection Summary
+            bigquery.SchemaField("ai_generated_detected_count", "INTEGER", mode="NULLABLE"),
+            bigquery.SchemaField("avg_ai_probability", "FLOAT", mode="NULLABLE"),
+            bigquery.SchemaField("high_ai_risk_count", "INTEGER", mode="NULLABLE"),
+            
+            # Technical & Domain (Aggregated)
+            bigquery.SchemaField("avg_technical_depth", "FLOAT", mode="NULLABLE"),
+            bigquery.SchemaField("avg_domain_relevance", "FLOAT", mode="NULLABLE"),
+            
+            # Bias Detection Summary
+            bigquery.SchemaField("total_bias_flags", "INTEGER", mode="NULLABLE"),
+            bigquery.SchemaField("bias_types_detected", "STRING", mode="REPEATED"),
+            
+            # Key Insights (Anonymized Patterns)
+            bigquery.SchemaField("common_strengths", "STRING", mode="REPEATED"),
+            bigquery.SchemaField("common_gaps", "STRING", mode="REPEATED"),
+            bigquery.SchemaField("key_recommendations", "STRING", mode="REPEATED"),
+            
+            # Metadata
+            bigquery.SchemaField("analysis_summary", "STRING", mode="NULLABLE"),
+            bigquery.SchemaField("meta", "STRING", mode="NULLABLE"),
+        ]
+    }
+    
+    # Create tables if they don't exist
+    for table_name, schema in schemas.items():
+        table_id = f"{DATASET_ID}.{table_name}"
+        try:
+            client.get_table(table_id)
+            print(f"✅ Table {table_name} exists")
+        except google_exceptions.NotFound:
+            print(f"⚠️  Table {table_name} not found. Creating...")
+            table = bigquery.Table(table_id, schema=schema)
+            client.create_table(table)
+            print(f"✅ Created table {table_name}")
+    
+    # Check journal_vectors table exists (should already exist from sentiment analysis)
+    try:
+        client.get_table(JOURNAL_VECTORS_TABLE)
+        print(f"✅ Table journal_vectors exists (shared table)")
+    except google_exceptions.NotFound:
+        print(f"⚠️  Table journal_vectors not found - it should exist from sentiment analysis setup")
+
+
+# ==================== Data Insertion Functions ====================
+
+def insert_ats_job(job_data: dict):
+    """
+    Insert ATS job metadata (NO candidate PII)
+    """
+    row = {
+        "job_id": job_data.get("job_id"),
+        "position_title": job_data.get("position_title"),
+        "organization": job_data.get("organization"),
+        "user_email": job_data.get("user_email"),  # Only client user
+        "total_candidates_analyzed": job_data.get("total_candidates", 0),
+        "status": job_data.get("status", "PENDING"),
+        "created_at": job_data.get("created_at", datetime.utcnow().isoformat()),
+        "updated_at": job_data.get("updated_at", datetime.utcnow().isoformat()),
+        "record_date": job_data.get("record_date", datetime.utcnow().date().isoformat()),
+        "record_date_str": job_data.get("record_date_str", datetime.utcnow().strftime("%d-%m-%Y")),
+        "meta": job_data.get("meta", "{}"),
+    }
+    
+    try:
+        errors = client.insert_rows_json(ATS_JOBS_TABLE, [row])
+        if errors:
+            print(f"❌ Error inserting ATS job: {errors}")
+            return False
+        else:
+            print(f"✅ Inserted ATS job: {row['job_id']}")
+            return True
+    except Exception as e:
+        print(f"❌ Exception inserting ATS job: {e}")
+        return False
+
+
+def insert_aggregated_ats_results(job_id: str, results: list):
+    """
+    Insert AGGREGATED results only - NO individual candidate data
+    
+    Args:
+        job_id: Job ID
+        results: List of individual analysis results (used for aggregation only)
+    """
+    
+    if not results:
+        return False
+    
+    # Calculate aggregated statistics
+    match_percentages = [r['overall_match_percentage'] for r in results]
+    
+    # Match distribution
+    high_match = sum(1 for r in results if r['overall_match_percentage'] >= 70)
+    medium_match = sum(1 for r in results if 50 <= r['overall_match_percentage'] < 70)
+    low_match = sum(1 for r in results if r['overall_match_percentage'] < 50)
+    
+    # Skills aggregation
+    all_missing_skills = []
+    all_found_skills = []
+    skills_matches = []
+    for r in results:
+        all_missing_skills.extend(r.get('skill_analysis', {}).get('missing_critical_skills', []))
+        all_found_skills.extend(r.get('skill_analysis', {}).get('matched_required_skills', []))
+        skills_matches.append(r.get('component_scores', {}).get('skills_match', 0))
+    
+    # Count occurrences and get most common
+    from collections import Counter
+    missing_counter = Counter(all_missing_skills)
+    found_counter = Counter(all_found_skills)
+    
+    most_common_missing = [skill for skill, count in missing_counter.most_common(10)]
+    most_common_found = [skill for skill, count in found_counter.most_common(10)]
+    
+    # Experience aggregation
+    experience_matches = [r.get('component_scores', {}).get('experience_match', 0) for r in results]
+    avg_candidate_years = sum(r.get('total_experience_years', 0) for r in results) / len(results)
+    
+    # AI detection aggregation
+    ai_detected_count = sum(
+        1 for r in results 
+        if r.get('ai_generated_flags', {}).get('is_likely_ai_generated', False)
+    )
+    high_ai_risk = sum(
+        1 for r in results 
+        if r.get('ai_generated_flags', {}).get('warning_level', 'low') == 'high'
+    )
+    ai_probabilities = [
+        r.get('ai_generated_flags', {}).get('ai_generated_probability', 0) 
+        for r in results
+    ]
+    
+    # Technical & Domain aggregation
+    technical_depths = [r.get('component_scores', {}).get('technical_depth', 0) for r in results]
+    domain_relevances = [r.get('component_scores', {}).get('domain_relevance', 0) for r in results]
+    
+    # Bias aggregation
+    all_bias_flags = []
+    for r in results:
+        all_bias_flags.extend(r.get('bias_flags', []))
+    bias_types = list(set(all_bias_flags))
+    
+    # Strengths and gaps aggregation (anonymized patterns)
+    all_strengths = []
+    all_gaps = []
+    all_recommendations = []
+    for r in results:
+        all_strengths.extend(r.get('strengths', []))
+        all_gaps.extend(r.get('gaps', []))
+        all_recommendations.extend(r.get('recommendations', []))
+    
+    strength_counter = Counter(all_strengths)
+    gap_counter = Counter(all_gaps)
+    rec_counter = Counter(all_recommendations)
+    
+    common_strengths = [s for s, c in strength_counter.most_common(5)]
+    common_gaps = [g for g, c in gap_counter.most_common(5)]
+    key_recommendations = [r for r, c in rec_counter.most_common(5)]
+    
+    # Create summary
+    summary = f"""
+ATS Analysis Summary:
+- Analyzed {len(results)} candidates
+- Average match: {sum(match_percentages)/len(match_percentages):.1f}%
+- High matches (≥70%): {high_match}
+- AI-generated detected: {ai_detected_count}
+- Most common missing skills: {', '.join(most_common_missing[:3])}
+    """.strip()
+    
+    # Insert aggregated row
+    row = {
+        "result_id": str(hashlib.md5(f"{job_id}_{datetime.utcnow().isoformat()}".encode()).hexdigest()[:12]),
+        "job_id": job_id,
+        "created_at": datetime.utcnow().isoformat(),
+        "record_date": datetime.utcnow().date().isoformat(),
+        "record_date_str": datetime.utcnow().strftime("%d-%m-%Y"),
+        
+        # Aggregated statistics
+        "total_candidates": len(results),
+        "avg_match_percentage": sum(match_percentages) / len(match_percentages),
+        "median_match_percentage": sorted(match_percentages)[len(match_percentages)//2],
+        "max_match_percentage": max(match_percentages),
+        "min_match_percentage": min(match_percentages),
+        
+        # Distribution
+        "high_match_count": high_match,
+        "medium_match_count": medium_match,
+        "low_match_count": low_match,
+        
+        # Skills
+        "avg_skills_match": sum(skills_matches) / len(skills_matches),
+        "most_common_missing_skills": most_common_missing,
+        "most_common_found_skills": most_common_found,
+        
+        # Experience
+        "avg_experience_match": sum(experience_matches) / len(experience_matches),
+        "avg_candidate_experience_years": avg_candidate_years,
+        
+        # AI Detection
+        "ai_generated_detected_count": ai_detected_count,
+        "avg_ai_probability": sum(ai_probabilities) / len(ai_probabilities),
+        "high_ai_risk_count": high_ai_risk,
+        
+        # Technical & Domain
+        "avg_technical_depth": sum(technical_depths) / len(technical_depths),
+        "avg_domain_relevance": sum(domain_relevances) / len(domain_relevances),
+        
+        # Bias
+        "total_bias_flags": len(all_bias_flags),
+        "bias_types_detected": bias_types,
+        
+        # Insights
+        "common_strengths": common_strengths,
+        "common_gaps": common_gaps,
+        "key_recommendations": key_recommendations,
+        
+        # Summary
+        "analysis_summary": summary,
+        "meta": json.dumps({"aggregated_from": len(results), "privacy_compliant": True}),
+    }
+    
+    try:
+        errors = client.insert_rows_json(ATS_RESULTS_TABLE, [row])
+        if errors:
+            print(f"❌ Error inserting aggregated results: {errors}")
+            return False
+        else:
+            print(f"✅ Inserted aggregated ATS results for job: {job_id}")
+            return True
+    except Exception as e:
+        print(f"❌ Exception inserting aggregated results: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def insert_ats_learning_to_journal(job_id: str, jd_summary: dict, results_summary: dict):
+    """
+    Insert learning insights to journal_vectors table
+    This creates knowledge from the ATS analysis without storing PII
+    
+    Args:
+        job_id: Job ID
+        jd_summary: Summary of JD requirements
+        results_summary: Aggregated analysis summary
+    """
+    
+    # Create learning summary
+    learning_summary = {
+        "analysis_type": "ats_recruitment",
+        "job_id": job_id,
+        "position_context": {
+            "role_level": jd_summary.get('role_level', 'Unknown'),
+            "domain": jd_summary.get('domain', 'Unknown'),
+            "required_skills_count": len(jd_summary.get('required_skills', [])),
+            "experience_required": jd_summary.get('experience_required', 0),
+            "technical_areas": jd_summary.get('technical_areas', [])
+        },
+        "market_insights": {
+            "total_candidates_analyzed": results_summary.get('total_candidates', 0),
+            "avg_match_percentage": results_summary.get('avg_match_percentage', 0),
+            "talent_availability": "high" if results_summary.get('high_match_count', 0) > results_summary.get('total_candidates', 1) * 0.3 else "medium" if results_summary.get('high_match_count', 0) > 0 else "low",
+            "skills_gap_analysis": results_summary.get('most_common_missing_skills', [])[:5],
+            "common_candidate_strengths": results_summary.get('common_strengths', [])[:5]
+        },
+        "ai_detection_insights": {
+            "ai_generated_cv_rate": results_summary.get('ai_generated_detected_count', 0) / max(results_summary.get('total_candidates', 1), 1),
+            "avg_ai_probability": results_summary.get('avg_ai_probability', 0),
+            "high_risk_count": results_summary.get('high_ai_risk_count', 0)
+        },
+        "recruitment_recommendations": results_summary.get('key_recommendations', [])[:5],
+        "timestamp": datetime.utcnow().isoformat()
+    }
+    
+    # Generate AI summary for semantic search
+    from utils.vertex_ai_utils import generate_freeform, generate_embedding
+    
+    ai_summary_prompt = f"""
+Analyze this ATS recruitment analysis and provide insights for future hiring decisions.
+
+Position Context:
+- Role: {jd_summary.get('role_level')} level in {jd_summary.get('domain')}
+- Required Skills: {', '.join(jd_summary.get('required_skills', [])[:10])}
+- Experience: {jd_summary.get('experience_required')} years
+- Technical Areas: {', '.join(jd_summary.get('technical_areas', []))}
+
+Market Analysis:
+- {results_summary.get('total_candidates', 0)} candidates analyzed
+- Average match: {results_summary.get('avg_match_percentage', 0):.1f}%
+- High matches: {results_summary.get('high_match_count', 0)}
+- Common gaps: {', '.join(results_summary.get('most_common_missing_skills', [])[:5])}
+- AI-generated CVs detected: {results_summary.get('ai_generated_detected_count', 0)}
+
+Provide a 2-3 sentence insight about:
+1. Talent market availability for this role
+2. Key skill gaps to address
+3. Recommendations for future recruitment
+
+Insight:
+"""
+    
+    try:
+        ai_summary = generate_freeform(ai_summary_prompt).strip()
+    except:
+        ai_summary = f"ATS analysis for {jd_summary.get('role_level')} {jd_summary.get('domain')} role with {results_summary.get('total_candidates', 0)} candidates analyzed."
+    
+    # Generate embedding for semantic search
+    embedding_text = f"""
+ATS Recruitment Analysis
+Role: {jd_summary.get('role_level')} in {jd_summary.get('domain')}
+Skills: {', '.join(jd_summary.get('required_skills', [])[:15])}
+Technical Areas: {', '.join(jd_summary.get('technical_areas', []))}
+Candidates Analyzed: {results_summary.get('total_candidates', 0)}
+Average Match: {results_summary.get('avg_match_percentage', 0):.1f}%
+Talent Availability: {learning_summary['market_insights']['talent_availability']}
+Common Skill Gaps: {', '.join(results_summary.get('most_common_missing_skills', [])[:5])}
+AI Detection Rate: {learning_summary['ai_detection_insights']['ai_generated_cv_rate']:.2%}
+
+{ai_summary}
+    """.strip()
+    
+    embedding_vector = generate_embedding(embedding_text)
+    
+    if not embedding_vector:
+        print(f"⚠️  Embedding generation failed for ATS learning")
+        embedding_vector = []
+    
+    # Generate content hash for deduplication
+    content_hash = hashlib.md5(f"{job_id}_{datetime.utcnow().date()}".encode()).hexdigest()[:12]
+    
+    # Insert into journal_vectors
+    journal_row = {
+        "pdf_name": f"ats_analysis_{content_hash}",
+        "title": f"ATS Analysis: {jd_summary.get('role_level')} {jd_summary.get('domain')} Role",
+        "embedding": embedding_vector,
+        "summary": json.dumps(learning_summary),
+        "source_type": "ats_analysis",
+        "created_at": datetime.utcnow().isoformat(),
+        "file_hash": content_hash,
+        "organization_id": "system",  # System-generated learning
+        "user_email": "ats_system"
+    }
+    
+    try:
+        errors = client.insert_rows_json(JOURNAL_VECTORS_TABLE, [journal_row])
+        if errors:
+            print(f"❌ Error inserting ATS learning to journal: {errors}")
+            return False
+        else:
+            print(f"✅ Inserted ATS learning to journal_vectors")
+            print(f"   📊 Position: {jd_summary.get('role_level')} {jd_summary.get('domain')}")
+            print(f"   👥 Candidates: {results_summary.get('total_candidates', 0)}")
+            print(f"   🎯 Avg Match: {results_summary.get('avg_match_percentage', 0):.1f}%")
+            print(f"   🤖 AI Detection Rate: {learning_summary['ai_detection_insights']['ai_generated_cv_rate']:.1%}")
+            return True
+    except Exception as e:
+        print(f"❌ Exception inserting ATS learning: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def update_ats_job_status(job_id: str, status: str, **kwargs):
+    """Update ATS job status"""
+    
+    updates = [f"status = '{status}'", "updated_at = CURRENT_TIMESTAMP()"]
+    
+    if status == "COMPLETED":
+        updates.append("completed_at = CURRENT_TIMESTAMP()")
+    
+    if "error_message" in kwargs:
+        error_msg = kwargs['error_message'].replace("'", "\\'")
+        updates.append(f"error_message = '{error_msg}'")
+    
+    if "report_url" in kwargs:
+        updates.append(f"report_url = '{kwargs['report_url']}'")
+    
+    if "total_candidates" in kwargs:
+        updates.append(f"total_candidates_analyzed = {kwargs['total_candidates']}")
+    
+    query = f"""
+    UPDATE `{ATS_JOBS_TABLE}`
+    SET {', '.join(updates)}
+    WHERE job_id = '{job_id}'
+    """
+    
+    try:
+        client.query(query).result()
+        print(f"✅ Updated job {job_id} status to: {status}")
+        return True
+    except Exception as e:
+        print(f"❌ Error updating job status: {e}")
+        return False
+
+
+# ==================== Query Functions ====================
+
+def get_ats_job(job_id: str) -> dict:
+    """Get ATS job by ID"""
+    query = f"""
+    SELECT *
+    FROM `{ATS_JOBS_TABLE}`
+    WHERE job_id = @job_id
+    LIMIT 1
+    """
+    
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("job_id", "STRING", job_id)
+        ]
+    )
+    
+    try:
+        results = list(client.query(query, job_config=job_config).result())
+        return dict(results[0]) if results else None
+    except Exception as e:
+        print(f"❌ Error getting job: {e}")
+        return None
+
+
+def get_ats_aggregated_results(job_id: str) -> dict:
+    """Get aggregated results for a job"""
+    query = f"""
+    SELECT *
+    FROM `{ATS_RESULTS_TABLE}`
+    WHERE job_id = @job_id
+    LIMIT 1
+    """
+    
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("job_id", "STRING", job_id)
+        ]
+    )
+    
+    try:
+        results = list(client.query(query, job_config=job_config).result())
+        return dict(results[0]) if results else None
+    except Exception as e:
+        print(f"❌ Error getting aggregated results: {e}")
+        return None
+
+# --- Table Definitions ---
+DATASET_ID = f"{config.PROJECT_ID}.{config.BQ_DATASET}"
+ATS_JOBS_TABLE = f"{DATASET_ID}.ats_jobs"
+ATS_RESULTS_TABLE = f"{DATASET_ID}.ats_results"
+ATS_CANDIDATES_TABLE = f"{DATASET_ID}.ats_candidates"
+
+# ==================== Table Schema Definitions ====================
+
+def ensure_ats_tables():
+    """
+    Ensure all required ATS BigQuery tables exist with proper schemas.
+    Creates them if they don't exist.
+    Similar to ensure_bigquery_tables() in sentiment_processing.py
+    """
+    
+    # Check if dataset exists
+    try:
+        client.get_dataset(DATASET_ID)
+        print(f"✅ Dataset {DATASET_ID} exists")
+    except google_exceptions.NotFound:
+        print(f"⚠️  Dataset {DATASET_ID} not found. Creating...")
+        dataset = bigquery.Dataset(DATASET_ID)
+        dataset.location = config.LOCATION
+        client.create_dataset(dataset, timeout=30)
+        print(f"✅ Created dataset {DATASET_ID}")
+    
+    # Define schemas for each table
+    schemas = {
+        "ats_jobs": [
+            bigquery.SchemaField("job_id", "STRING", mode="REQUIRED"),
+            bigquery.SchemaField("position_title", "STRING", mode="NULLABLE"),
+            bigquery.SchemaField("organization", "STRING", mode="NULLABLE"),
+            bigquery.SchemaField("user_email", "STRING", mode="NULLABLE"),
+            bigquery.SchemaField("job_description", "STRING", mode="NULLABLE"),
+            bigquery.SchemaField("total_candidates", "INTEGER", mode="NULLABLE"),
+            bigquery.SchemaField("status", "STRING", mode="NULLABLE"),  # PENDING, PROCESSING, COMPLETED, FAILED
+            bigquery.SchemaField("created_at", "TIMESTAMP", mode="NULLABLE"),
+            bigquery.SchemaField("updated_at", "TIMESTAMP", mode="NULLABLE"),
+            bigquery.SchemaField("completed_at", "TIMESTAMP", mode="NULLABLE"),
+            bigquery.SchemaField("record_date", "DATE", mode="NULLABLE"),
+            bigquery.SchemaField("record_date_str", "STRING", mode="NULLABLE"),
+            bigquery.SchemaField("report_url", "STRING", mode="NULLABLE"),
+            bigquery.SchemaField("error_message", "STRING", mode="NULLABLE"),
+            bigquery.SchemaField("meta", "STRING", mode="NULLABLE"),  # JSON string for flexible data
+        ],
+        
+        "ats_results": [
+            bigquery.SchemaField("result_id", "STRING", mode="REQUIRED"),
+            bigquery.SchemaField("job_id", "STRING", mode="NULLABLE"),
+            bigquery.SchemaField("candidate_rank", "INTEGER", mode="NULLABLE"),
+            bigquery.SchemaField("created_at", "TIMESTAMP", mode="NULLABLE"),
+            bigquery.SchemaField("record_date", "DATE", mode="NULLABLE"),
+            bigquery.SchemaField("record_date_str", "STRING", mode="NULLABLE"),
+            
+            # Candidate Info
+            bigquery.SchemaField("candidate_name", "STRING", mode="NULLABLE"),
+            bigquery.SchemaField("email", "STRING", mode="NULLABLE"),
+            bigquery.SchemaField("phone", "STRING", mode="NULLABLE"),
+            bigquery.SchemaField("current_company", "STRING", mode="NULLABLE"),
+            bigquery.SchemaField("total_experience_years", "FLOAT", mode="NULLABLE"),
+            
+            # Scoring
+            bigquery.SchemaField("overall_match_percentage", "FLOAT", mode="NULLABLE"),
+            bigquery.SchemaField("confidence_score", "FLOAT", mode="NULLABLE"),
+            bigquery.SchemaField("skills_match_percentage", "FLOAT", mode="NULLABLE"),
+            bigquery.SchemaField("experience_match_percentage", "FLOAT", mode="NULLABLE"),
+            bigquery.SchemaField("technical_depth_score", "FLOAT", mode="NULLABLE"),
+            bigquery.SchemaField("domain_relevance_score", "FLOAT", mode="NULLABLE"),
+            
+            # AI Detection
+            bigquery.SchemaField("ai_generated_probability", "FLOAT", mode="NULLABLE"),
+            bigquery.SchemaField("ai_detection_verdict", "STRING", mode="NULLABLE"),
+            bigquery.SchemaField("ai_warning_level", "STRING", mode="NULLABLE"),
+            
+            # Analysis Summary
+            bigquery.SchemaField("match_reason", "STRING", mode="NULLABLE"),
+            bigquery.SchemaField("top_strengths", "STRING", mode="REPEATED"),
+            bigquery.SchemaField("key_gaps", "STRING", mode="REPEATED"),
+            bigquery.SchemaField("recommendations", "STRING", mode="REPEATED"),
+            
+            # Detailed Analysis (stored as JSON strings)
+            bigquery.SchemaField("skill_analysis_json", "STRING", mode="NULLABLE"),
+            bigquery.SchemaField("experience_analysis_json", "STRING", mode="NULLABLE"),
+            bigquery.SchemaField("technical_analysis_json", "STRING", mode="NULLABLE"),
+            bigquery.SchemaField("domain_analysis_json", "STRING", mode="NULLABLE"),
+            bigquery.SchemaField("ai_detection_json", "STRING", mode="NULLABLE"),
+            
+            # Bias Detection
+            bigquery.SchemaField("bias_flags", "STRING", mode="REPEATED"),
+            bigquery.SchemaField("bias_explanation", "STRING", mode="NULLABLE"),
+            
+            # Metadata
+            bigquery.SchemaField("cv_filename", "STRING", mode="NULLABLE"),
+            bigquery.SchemaField("analysis_id", "STRING", mode="NULLABLE"),
+            bigquery.SchemaField("meta", "STRING", mode="NULLABLE"),
+        ],
+        
+        "ats_candidates": [
+            # Master table for all candidates (deduplicated by email)
+            bigquery.SchemaField("candidate_id", "STRING", mode="REQUIRED"),
+            bigquery.SchemaField("candidate_name", "STRING", mode="NULLABLE"),
+            bigquery.SchemaField("email", "STRING", mode="NULLABLE"),
+            bigquery.SchemaField("phone", "STRING", mode="NULLABLE"),
+            bigquery.SchemaField("current_company", "STRING", mode="NULLABLE"),
+            bigquery.SchemaField("total_experience_years", "FLOAT", mode="NULLABLE"),
+            
+            # Skills (from most recent analysis)
+            bigquery.SchemaField("skills", "STRING", mode="REPEATED"),
+            bigquery.SchemaField("certifications", "STRING", mode="REPEATED"),
+            
+            # Education
+            bigquery.SchemaField("education_json", "STRING", mode="NULLABLE"),
+            
+            # Analysis History
+            bigquery.SchemaField("times_analyzed", "INTEGER", mode="NULLABLE"),
+            bigquery.SchemaField("average_match_score", "FLOAT", mode="NULLABLE"),
+            bigquery.SchemaField("best_match_score", "FLOAT", mode="NULLABLE"),
+            bigquery.SchemaField("best_match_position", "STRING", mode="NULLABLE"),
+            
+            # AI Detection Summary
+            bigquery.SchemaField("ai_detection_count", "INTEGER", mode="NULLABLE"),
+            bigquery.SchemaField("avg_ai_probability", "FLOAT", mode="NULLABLE"),
+            
+            # Timestamps
+            bigquery.SchemaField("first_analyzed", "TIMESTAMP", mode="NULLABLE"),
+            bigquery.SchemaField("last_analyzed", "TIMESTAMP", mode="NULLABLE"),
+            bigquery.SchemaField("created_at", "TIMESTAMP", mode="NULLABLE"),
+            bigquery.SchemaField("updated_at", "TIMESTAMP", mode="NULLABLE"),
+            
+            # Full CV data (latest)
+            bigquery.SchemaField("cv_structured_json", "STRING", mode="NULLABLE"),
+            bigquery.SchemaField("meta", "STRING", mode="NULLABLE"),
+        ]
+    }
+    
+    # Create tables if they don't exist
+    for table_name, schema in schemas.items():
+        table_id = f"{DATASET_ID}.{table_name}"
+        try:
+            client.get_table(table_id)
+            print(f"✅ Table {table_name} exists")
+        except google_exceptions.NotFound:
+            print(f"⚠️  Table {table_name} not found. Creating...")
+            table = bigquery.Table(table_id, schema=schema)
+            client.create_table(table)
+            print(f"✅ Created table {table_name}")
+
+
+# ==================== Data Insertion Functions ====================
+
+def insert_ats_job(job_data: dict):
+    """
+    Insert a new ATS job record
+    
+    Args:
+        job_data: Dictionary with job information
+    """
+    row = {
+        "job_id": job_data.get("job_id"),
+        "position_title": job_data.get("position_title"),
+        "organization": job_data.get("organization"),
+        "user_email": job_data.get("user_email"),
+        "job_description": job_data.get("job_description", "")[:5000],  # Truncate if too long
+        "total_candidates": job_data.get("total_candidates", 0),
+        "status": job_data.get("status", "PENDING"),
+        "created_at": job_data.get("created_at", datetime.utcnow().isoformat()),
+        "updated_at": job_data.get("updated_at", datetime.utcnow().isoformat()),
+        "record_date": job_data.get("record_date", datetime.utcnow().date().isoformat()),
+        "record_date_str": job_data.get("record_date_str", datetime.utcnow().strftime("%d-%m-%Y")),
+        "meta": job_data.get("meta", "{}"),
+    }
+    
+    try:
+        errors = client.insert_rows_json(ATS_JOBS_TABLE, [row])
+        if errors:
+            print(f"❌ Error inserting ATS job: {errors}")
+            return False
+        else:
+            print(f"✅ Inserted ATS job: {row['job_id']}")
+            return True
+    except Exception as e:
+        print(f"❌ Exception inserting ATS job: {e}")
+        return False
+
+
+def insert_ats_result(result_data: dict):
+    """
+    Insert an ATS analysis result for a candidate
+    
+    Args:
+        result_data: Dictionary with complete analysis result
+    """
+    import json
+    
+    row = {
+        "result_id": result_data.get("analysis_id"),
+        "job_id": result_data.get("job_id"),
+        "candidate_rank": result_data.get("rank"),
+        "created_at": result_data.get("analyzed_at", datetime.utcnow().isoformat()),
+        "record_date": datetime.utcnow().date().isoformat(),
+        "record_date_str": datetime.utcnow().strftime("%d-%m-%Y"),
+        
+        # Candidate info
+        "candidate_name": result_data.get("candidate_name"),
+        "email": result_data.get("email"),
+        "phone": result_data.get("phone"),
+        "current_company": result_data.get("current_company"),
+        "total_experience_years": float(result_data.get("total_experience_years", 0)),
+        
+        # Scoring
+        "overall_match_percentage": float(result_data.get("overall_match_percentage", 0)),
+        "confidence_score": float(result_data.get("confidence_score", 0)),
+        "skills_match_percentage": float(result_data.get("component_scores", {}).get("skills_match", 0)),
+        "experience_match_percentage": float(result_data.get("component_scores", {}).get("experience_match", 0)),
+        "technical_depth_score": float(result_data.get("component_scores", {}).get("technical_depth", 0)),
+        "domain_relevance_score": float(result_data.get("component_scores", {}).get("domain_relevance", 0)),
+        
+        # AI Detection
+        "ai_generated_probability": float(result_data.get("ai_generated_flags", {}).get("ai_generated_probability", 0)) if result_data.get("ai_generated_flags") else 0.0,
+        "ai_detection_verdict": result_data.get("ai_generated_flags", {}).get("final_verdict") if result_data.get("ai_generated_flags") else "Not Analyzed",
+        "ai_warning_level": result_data.get("ai_generated_flags", {}).get("warning_level") if result_data.get("ai_generated_flags") else "low",
+        
+        # Summary
+        "match_reason": result_data.get("match_reason", "")[:5000],
+        "top_strengths": result_data.get("strengths", []),
+        "key_gaps": result_data.get("gaps", []),
+        "recommendations": result_data.get("recommendations", []),
+        
+        # Detailed analysis as JSON
+        "skill_analysis_json": json.dumps(result_data.get("skill_analysis", {})),
+        "experience_analysis_json": json.dumps(result_data.get("experience_analysis", {})),
+        "technical_analysis_json": json.dumps(result_data.get("technical_analysis", {})),
+        "domain_analysis_json": json.dumps(result_data.get("domain_analysis", {})),
+        "ai_detection_json": json.dumps(result_data.get("ai_generated_flags", {})),
+        
+        # Bias
+        "bias_flags": result_data.get("bias_flags", []),
+        "bias_explanation": result_data.get("bias_explanation", ""),
+        
+        # Metadata
+        "cv_filename": result_data.get("cv_filename"),
+        "analysis_id": result_data.get("analysis_id"),
+        "meta": json.dumps({"source": "ats_analysis"}),
+    }
+    
+    try:
+        errors = client.insert_rows_json(ATS_RESULTS_TABLE, [row])
+        if errors:
+            print(f"❌ Error inserting ATS result: {errors}")
+            return False
+        else:
+            print(f"✅ Inserted ATS result for: {row['candidate_name']}")
+            return True
+    except Exception as e:
+        print(f"❌ Exception inserting ATS result: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def upsert_ats_candidate(candidate_data: dict, analysis_result: dict):
+    """
+    Insert or update candidate master record
+    
+    Args:
+        candidate_data: Structured CV data
+        analysis_result: Latest analysis result
+    """
+    import json
+    import hashlib
+    
+    # Generate candidate ID from email
+    email = candidate_data.get("email", "unknown@example.com")
+    candidate_id = hashlib.md5(email.encode()).hexdigest()[:12]
+    
+    # Check if candidate exists
+    query = f"""
+    SELECT candidate_id, times_analyzed, average_match_score, best_match_score, 
+           ai_detection_count, avg_ai_probability, first_analyzed
+    FROM `{ATS_CANDIDATES_TABLE}`
+    WHERE candidate_id = @candidate_id
+    LIMIT 1
+    """
+    
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("candidate_id", "STRING", candidate_id)
+        ]
+    )
+    
+    try:
+        results = list(client.query(query, job_config=job_config).result())
+        
+        now = datetime.utcnow().isoformat()
+        
+        if results:
+            # Update existing candidate
+            existing = dict(results[0])
+            
+            times_analyzed = existing.get("times_analyzed", 0) + 1
+            current_match = analysis_result.get("overall_match_percentage", 0)
+            avg_match = ((existing.get("average_match_score", 0) * existing.get("times_analyzed", 0)) + current_match) / times_analyzed
+            best_match = max(existing.get("best_match_score", 0), current_match)
+            
+            ai_detection_count = existing.get("ai_detection_count", 0)
+            if analysis_result.get("ai_generated_flags", {}).get("is_likely_ai_generated"):
+                ai_detection_count += 1
+            
+            current_ai_prob = analysis_result.get("ai_generated_flags", {}).get("ai_generated_probability", 0)
+            avg_ai_prob = ((existing.get("avg_ai_probability", 0) * existing.get("times_analyzed", 0)) + current_ai_prob) / times_analyzed
+            
+            # Use MERGE or UPDATE
+            update_query = f"""
+            UPDATE `{ATS_CANDIDATES_TABLE}`
+            SET 
+                candidate_name = @name,
+                phone = @phone,
+                current_company = @company,
+                total_experience_years = @experience,
+                skills = @skills,
+                certifications = @certifications,
+                education_json = @education,
+                times_analyzed = @times_analyzed,
+                average_match_score = @avg_match,
+                best_match_score = @best_match,
+                ai_detection_count = @ai_count,
+                avg_ai_probability = @avg_ai,
+                last_analyzed = @last_analyzed,
+                updated_at = @updated_at,
+                cv_structured_json = @cv_json
+            WHERE candidate_id = @candidate_id
+            """
+            
+            update_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ScalarQueryParameter("candidate_id", "STRING", candidate_id),
+                    bigquery.ScalarQueryParameter("name", "STRING", candidate_data.get("name")),
+                    bigquery.ScalarQueryParameter("phone", "STRING", candidate_data.get("phone")),
+                    bigquery.ScalarQueryParameter("company", "STRING", candidate_data.get("current_company")),
+                    bigquery.ScalarQueryParameter("experience", "FLOAT", float(candidate_data.get("total_experience", 0))),
+                    bigquery.ArrayQueryParameter("skills", "STRING", candidate_data.get("skills", [])),
+                    bigquery.ArrayQueryParameter("certifications", "STRING", candidate_data.get("certifications", [])),
+                    bigquery.ScalarQueryParameter("education", "STRING", json.dumps(candidate_data.get("education", []))),
+                    bigquery.ScalarQueryParameter("times_analyzed", "INT64", times_analyzed),
+                    bigquery.ScalarQueryParameter("avg_match", "FLOAT", avg_match),
+                    bigquery.ScalarQueryParameter("best_match", "FLOAT", best_match),
+                    bigquery.ScalarQueryParameter("ai_count", "INT64", ai_detection_count),
+                    bigquery.ScalarQueryParameter("avg_ai", "FLOAT", avg_ai_prob),
+                    bigquery.ScalarQueryParameter("last_analyzed", "TIMESTAMP", now),
+                    bigquery.ScalarQueryParameter("updated_at", "TIMESTAMP", now),
+                    bigquery.ScalarQueryParameter("cv_json", "STRING", json.dumps(candidate_data)),
+                ]
+            )
+            
+            client.query(update_query, job_config=update_config).result()
+            print(f"✅ Updated candidate: {candidate_data.get('name')}")
+            
+        else:
+            # Insert new candidate
+            row = {
+                "candidate_id": candidate_id,
+                "candidate_name": candidate_data.get("name"),
+                "email": email,
+                "phone": candidate_data.get("phone"),
+                "current_company": candidate_data.get("current_company"),
+                "total_experience_years": float(candidate_data.get("total_experience", 0)),
+                "skills": candidate_data.get("skills", []),
+                "certifications": candidate_data.get("certifications", []),
+                "education_json": json.dumps(candidate_data.get("education", [])),
+                "times_analyzed": 1,
+                "average_match_score": float(analysis_result.get("overall_match_percentage", 0)),
+                "best_match_score": float(analysis_result.get("overall_match_percentage", 0)),
+                "best_match_position": analysis_result.get("job_id", ""),
+                "ai_detection_count": 1 if analysis_result.get("ai_generated_flags", {}).get("is_likely_ai_generated") else 0,
+                "avg_ai_probability": float(analysis_result.get("ai_generated_flags", {}).get("ai_generated_probability", 0)),
+                "first_analyzed": now,
+                "last_analyzed": now,
+                "created_at": now,
+                "updated_at": now,
+                "cv_structured_json": json.dumps(candidate_data),
+                "meta": json.dumps({}),
+            }
+            
+            errors = client.insert_rows_json(ATS_CANDIDATES_TABLE, [row])
+            if errors:
+                print(f"❌ Error inserting candidate: {errors}")
+                return False
+            else:
+                print(f"✅ Inserted new candidate: {row['candidate_name']}")
+                return True
+                
+    except Exception as e:
+        print(f"❌ Exception in upsert_candidate: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def update_ats_job_status(job_id: str, status: str, **kwargs):
+    """
+    Update ATS job status
+    
+    Args:
+        job_id: Job ID to update
+        status: New status (PROCESSING, COMPLETED, FAILED)
+        **kwargs: Additional fields to update
+    """
+    
+    updates = [f"status = '{status}'", f"updated_at = CURRENT_TIMESTAMP()"]
+    
+    if status == "COMPLETED":
+        updates.append("completed_at = CURRENT_TIMESTAMP()")
+    
+    if "error_message" in kwargs:
+        updates.append(f"error_message = '{kwargs['error_message']}'")
+    
+    if "report_url" in kwargs:
+        updates.append(f"report_url = '{kwargs['report_url']}'")
+    
+    if "total_candidates" in kwargs:
+        updates.append(f"total_candidates = {kwargs['total_candidates']}")
+    
+    query = f"""
+    UPDATE `{ATS_JOBS_TABLE}`
+    SET {', '.join(updates)}
+    WHERE job_id = '{job_id}'
+    """
+    
+    try:
+        client.query(query).result()
+        print(f"✅ Updated job {job_id} status to: {status}")
+        return True
+    except Exception as e:
+        print(f"❌ Error updating job status: {e}")
+        return False
+
+
+# ==================== Query Functions ====================
+
+def get_ats_job(job_id: str) -> dict:
+    """Get ATS job by ID"""
+    query = f"""
+    SELECT *
+    FROM `{ATS_JOBS_TABLE}`
+    WHERE job_id = @job_id
+    LIMIT 1
+    """
+    
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("job_id", "STRING", job_id)
+        ]
+    )
+    
+    try:
+        results = list(client.query(query, job_config=job_config).result())
+        return dict(results[0]) if results else None
+    except Exception as e:
+        print(f"❌ Error getting job: {e}")
+        return None
+
+
+def get_ats_results(job_id: str) -> list:
+    """Get all results for a job"""
+    query = f"""
+    SELECT *
+    FROM `{ATS_RESULTS_TABLE}`
+    WHERE job_id = @job_id
+    ORDER BY overall_match_percentage DESC
+    """
+    
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("job_id", "STRING", job_id)
+        ]
+    )
+    
+    try:
+        results = client.query(query, job_config=job_config).result()
+        return [dict(row) for row in results]
+    except Exception as e:
+        print(f"❌ Error getting results: {e}")
+        return []
+
+
+def get_candidate_history(email: str) -> list:
+    """Get analysis history for a candidate"""
+    query = f"""
+    SELECT *
+    FROM `{ATS_RESULTS_TABLE}`
+    WHERE email = @email
+    ORDER BY created_at DESC
+    """
+    
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("email", "STRING", email)
+        ]
+    )
+    
+    try:
+        results = client.query(query, job_config=job_config).result()
+        return [dict(row) for row in results]
+    except Exception as e:
+        print(f"❌ Error getting candidate history: {e}")
+        return []
