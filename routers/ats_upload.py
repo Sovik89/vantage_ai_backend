@@ -177,8 +177,18 @@ async def submit_ats_job(
             
             print(f"✅ Excel report generated: {excel_path}")
             
-            # Upload to GCS
-            storage_client = storage.Client(project=config.PROJECT_ID)
+            # Upload to GCS using service account (for URL signing)
+            from google.oauth2 import service_account
+            from datetime import timedelta
+            
+            signing_credentials = service_account.Credentials.from_service_account_file(
+                config.SA_KEY_PATH
+            )
+            
+            storage_client = storage.Client(
+                project=config.PROJECT_ID,
+                credentials=signing_credentials
+            )
             bucket_name = config.GCS_BUCKET
             
             # Create folder structure: ats-reports/{user_email}/{job_id}/
@@ -191,7 +201,6 @@ async def submit_ats_job(
             blob.upload_from_filename(excel_path)
             
             # Generate signed URL (valid for 7 days)
-            from datetime import timedelta
             signed_url = blob.generate_signed_url(
                 version="v4",
                 expiration=timedelta(days=7),

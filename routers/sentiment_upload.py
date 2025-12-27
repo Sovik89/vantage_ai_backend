@@ -169,9 +169,10 @@ async def submit_sentiment_job(
         
         print(f"✅ Job ID: {job_id}")
         
-        # Upload Excel to GCS
+        # Upload Excel to GCS using service account (for URL signing)
         report_url = None
         try:
+            from google.oauth2 import service_account
             from worker.sentiment_processing import LOCAL_REPORT_DIR
             local_excel_path = os.path.join(LOCAL_REPORT_DIR, f"sentiment-candidate-report-{job_id}.xlsx")
             
@@ -180,7 +181,16 @@ async def submit_sentiment_job(
                 bucket_name = config.GCS_BUCKET
                 blob_path = f"sentiment-reports/{user_email.replace('@', '_at_').replace('.', '_')}/{job_id}/{excel_filename}"
                 
-                bucket = _storage.bucket(bucket_name)
+                # Use service account for signing
+                signing_credentials = service_account.Credentials.from_service_account_file(
+                    config.SA_KEY_PATH
+                )
+                storage_client = storage.Client(
+                    project=config.PROJECT_ID,
+                    credentials=signing_credentials
+                )
+                
+                bucket = storage_client.bucket(bucket_name)
                 blob = bucket.blob(blob_path)
                 blob.upload_from_filename(local_excel_path)
                 

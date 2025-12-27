@@ -25,10 +25,22 @@ from schemas.linkedin_models import (
     LinkedInAnalysis
 )
 # LinkedIn scraping clients - imported dynamically based on config
-# from utils.rapidapi_linkedin_client import scrape_linkedin_profiles, search_linkedin_candidates
-# from utils.scrapedo_linkedin_client import scrape_linkedin_profiles, search_linkedin_candidates
-# from utils.scrapingbee_linkedin_client import scrape_linkedin_profiles, search_linkedin_candidates
-# from utils.scraperapi_linkedin_client import scrape_linkedin_profiles, search_linkedin_candidates
+if config.USE_MOCK_LINKEDIN_DATA:
+    print("🧪 MOCK MODE: Using mock LinkedIn data generator")
+    from utils.mock_linkedin_data import (
+        mock_search_linkedin_candidates as search_linkedin_candidates,
+        mock_scrape_linkedin_profiles as scrape_linkedin_profiles,
+        generate_mock_candidates
+    )
+else:
+    print("🌐 LIVE MODE: Using real LinkedIn scraping")
+    # from utils.rapidapi_linkedin_client import scrape_linkedin_profiles, search_linkedin_candidates
+    # from utils.scrapedo_linkedin_client import scrape_linkedin_profiles, search_linkedin_candidates
+    # from utils.scrapingbee_linkedin_client import scrape_linkedin_profiles, search_linkedin_candidates
+    # from utils.scraperapi_linkedin_client import scrape_linkedin_profiles, search_linkedin_candidates
+    from utils.simple_linkedin_scraper import scrape_linkedin_candidates
+    search_linkedin_candidates = None  # Not implemented in simple scraper
+
 from utils.vertex_ai_utils import analyze_linkedin_candidate, generate_linkedin_summary_report
 
 router = APIRouter()
@@ -235,24 +247,37 @@ async def process_linkedin_scout_job(
         linkedin_urls = []
         search_provider_used = "simple_scraper"
         
-        # Use simple scraper only - no paid APIs
-        print("   🔍 Using simple scraper with known public profiles")
-        
-        # Step 1b: Use simple scraper to fetch profiles
-        print(f"🕷️ Step 1b: Using simple LinkedIn scraper...")
-        
-        from utils.simple_linkedin_scraper import scrape_linkedin_candidates
-        
-        scraped_profiles = scrape_linkedin_candidates(
-            job_description=job_description,
-            location=location,
-            target_count=num_candidates  # Max 5 profiles
-        )
-        
-        if scraped_profiles:
-            print(f"✅ Successfully scraped {len(scraped_profiles)} profiles")
+        # Check if using mock data
+        if config.USE_MOCK_LINKEDIN_DATA:
+            print("   🧪 Using MOCK LinkedIn data (no scraping)")
+            
+            # Generate mock candidates directly
+            print(f"🎭 Generating {num_candidates} mock LinkedIn profiles...")
+            
+            scraped_profiles = generate_mock_candidates(
+                job_role=job_title_keyword.lower().replace(' ', '_'),
+                num_candidates=num_candidates,
+                location=location
+            )
+            
+            print(f"✅ Generated {len(scraped_profiles)} mock profiles")
         else:
-            print(f"⚠️  No profiles found. Try different keywords or location.")
+            # Use simple scraper only - no paid APIs
+            print("   🔍 Using simple scraper with known public profiles")
+            
+            # Step 1b: Use simple scraper to fetch profiles
+            print(f"🕷️ Step 1b: Using simple LinkedIn scraper...")
+            
+            scraped_profiles = scrape_linkedin_candidates(
+                job_description=job_description,
+                location=location,
+                target_count=num_candidates  # Max 5 profiles
+            )
+            
+            if scraped_profiles:
+                print(f"✅ Successfully scraped {len(scraped_profiles)} profiles")
+            else:
+                print(f"⚠️  No profiles found. Try different keywords or location.")
         
         # Step 2: Analyze each profile
         print(f"🧠 Step 2: Analyzing profiles against JD...")
@@ -474,8 +499,20 @@ No candidates found matching the search criteria.
                 
                 print(f"   ✅ Excel report generated: {excel_path}")
                 
-                # Upload to GCS
-                storage_client = get_storage_client()
+                # Upload to GCS using service account (needed for signing URLs)
+                from google.oauth2 import service_account
+                from datetime import timedelta
+                
+                # Use service account credentials for both upload and signing
+                signing_credentials = service_account.Credentials.from_service_account_file(
+                    config.SA_KEY_PATH
+                )
+                
+                storage_client = storage.Client(
+                    project=config.PROJECT_ID,
+                    credentials=signing_credentials
+                )
+                
                 bucket_name = config.GCS_BUCKET
                 
                 # Create folder structure: linkedin-reports/{user_email}/{job_id}/
@@ -493,8 +530,7 @@ No candidates found matching the search criteria.
                     content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
                 )
                 
-                # Generate signed URL (valid for 7 days) with download disposition
-                from datetime import timedelta
+                # Generate signed URL (same credentials used for upload)
                 excel_url = blob.generate_signed_url(
                     version="v4",
                     expiration=timedelta(days=7),
@@ -745,7 +781,8 @@ Top Candidates:
             "record_date": now.date().isoformat(),
             "file_hash": job_id,
             "organization_id": "default_org",
-            "user_email": user_email
+            "user_email": user_email,
+            "created_at": now.isoformat()  # Convert datetime to ISO string
         }
         
         # Insert into journal_vectors

@@ -3,6 +3,19 @@
 # POC to POC Transfer: hr-analytics-demo → vantage-ai-prod (Nov 22, 2025)
 # Old POC project hr-analytics-demo DECOMMISSIONED on November 22, 2025
 
+import os
+
+# Hybrid Authentication Setup:
+# - OAuth for Vertex AI, BigQuery (application default credentials)
+# - Service Account Key for URL signing (requires private key)
+
+# Primary: Use OAuth Application Default Credentials
+if os.path.exists(r"C:\Users\sovik\AppData\Roaming\gcloud\application_default_credentials.json"):
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = r"C:\Users\sovik\AppData\Roaming\gcloud\application_default_credentials.json"
+
+# Service Account Key Path (used explicitly for URL signing)
+SA_KEY_PATH = r"C:\DataEngineering\1GenAI_demo_for_PA_in_GCP\vantage_ai_backend-main_code\vantage_api\keys\sa-keys.json"
+
 # GCP Project settings
 PROJECT_ID = "vantage-ai-prod"
 LOCATION = "us-central1"  # Vertex AI region
@@ -31,7 +44,7 @@ RAPIDAPI_KEY = "42f6f2cc8fmsh34de4f5ad2a8598p15ed41jsnf9059c925c83"
 # The system automatically uses ScrapingBee for search and RapidAPI for profiles
 
 # Mock mode for testing/demo (bypass real LinkedIn scraping)
-USE_MOCK_LINKEDIN_DATA = False  # ✅ REAL LinkedIn scraping enabled for production
+USE_MOCK_LINKEDIN_DATA = True  # ✅ MOCK data enabled for demo (no scraping costs)
 
 # GCS Bucket Configuration
 GCS_BUCKET = "vantage-ai-prod-pdfs"
